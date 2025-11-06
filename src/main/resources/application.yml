@@ -1,0 +1,28 @@
+spring:
+  application:
+    name: syncfusion-collaborative-editing
+
+  # Redis Configuration
+  data:
+    redis:
+      host: localhost
+      port: 6379
+      password:
+      timeout: 60000
+
+# Server Configuration
+server:
+  port: 8098
+
+# MinIO (S3-compatible) Configuration
+minio:
+  endpoint: http://localhost:9000
+  access-key: minioadmin
+  secret-key: minioadmin
+  bucket-name: syncfusion-documents
+  region: us-east-1
+
+# Collaborative Editing Configuration
+collaborative:
+  save-threshold: 150
+  redis-pub-sub-channel: collaborativeediting

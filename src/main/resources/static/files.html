@@ -1,0 +1,427 @@
+<!DOCTYPE html>
+<html lang="en">
+<head>
+    <meta charset="UTF-8">
+    <meta name="viewport" content="width=device-width, initial-scale=1.0">
+    <title>Files - Collaborative Document Editor</title>
+    <style>
+        * {
+            margin: 0;
+            padding: 0;
+            box-sizing: border-box;
+        }
+
+        body {
+            font-family: -apple-system, BlinkMacSystemFont, 'Segoe UI', Roboto, Oxygen, Ubuntu, Cantarell, sans-serif;
+            background: #f5f7fa;
+            min-height: 100vh;
+        }
+
+        .header {
+            background: white;
+            box-shadow: 0 2px 4px rgba(0, 0, 0, 0.1);
+            padding: 15px 30px;
+            display: flex;
+            justify-content: space-between;
+            align-items: center;
+        }
+
+        .header h1 {
+            color: #333;
+            font-size: 24px;
+        }
+
+        .header-actions {
+            display: flex;
+            gap: 15px;
+            align-items: center;
+        }
+
+        .user-info {
+            color: #666;
+            font-size: 14px;
+        }
+
+        .logout-btn {
+            padding: 8px 16px;
+            background: #dc3545;
+            color: white;
+            border: none;
+            border-radius: 6px;
+            font-size: 14px;
+            cursor: pointer;
+            transition: background 0.2s;
+        }
+
+        .logout-btn:hover {
+            background: #c82333;
+        }
+
+        .container {
+            max-width: 1200px;
+            margin: 30px auto;
+            padding: 0 20px;
+        }
+
+        .toolbar {
+            background: white;
+            border-radius: 8px;
+            padding: 20px;
+            margin-bottom: 20px;
+            box-shadow: 0 2px 4px rgba(0, 0, 0, 0.1);
+            display: flex;
+            gap: 15px;
+            align-items: center;
+        }
+
+        .upload-section {
+            display: flex;
+            gap: 10px;
+            align-items: center;
+        }
+
+        .file-input-label {
+            padding: 10px 20px;
+            background: linear-gradient(135deg, #667eea 0%, #764ba2 100%);
+            color: white;
+            border-radius: 6px;
+            font-size: 14px;
+            font-weight: 500;
+            cursor: pointer;
+            transition: transform 0.2s;
+        }
+
+        .file-input-label:hover {
+            transform: translateY(-2px);
+        }
+
+        #fileInput {
+            display: none;
+        }
+
+        .upload-btn {
+            padding: 10px 20px;
+            background: #28a745;
+            color: white;
+            border: none;
+            border-radius: 6px;
+            font-size: 14px;
+            font-weight: 500;
+            cursor: pointer;
+            transition: background 0.2s;
+        }
+
+        .upload-btn:hover {
+            background: #218838;
+        }
+
+        .upload-btn:disabled {
+            background: #ccc;
+            cursor: not-allowed;
+        }
+
+        .selected-file {
+            color: #666;
+            font-size: 14px;
+        }
+
+        .files-grid {
+            display: grid;
+            grid-template-columns: repeat(auto-fill, minmax(250px, 1fr));
+            gap: 20px;
+        }
+
+        .file-card {
+            background: white;
+            border-radius: 8px;
+            padding: 20px;
+            box-shadow: 0 2px 4px rgba(0, 0, 0, 0.1);
+            cursor: pointer;
+            transition: transform 0.2s, box-shadow 0.2s;
+        }
+
+        .file-card:hover {
+            transform: translateY(-4px);
+            box-shadow: 0 4px 12px rgba(0, 0, 0, 0.15);
+        }
+
+        .file-icon {
+            width: 60px;
+            height: 60px;
+            background: linear-gradient(135deg, #667eea 0%, #764ba2 100%);
+            border-radius: 8px;
+            display: flex;
+            align-items: center;
+            justify-content: center;
+            margin-bottom: 15px;
+            font-size: 28px;
+            color: white;
+        }
+
+        .file-name {
+            font-size: 16px;
+            font-weight: 500;
+            color: #333;
+            word-break: break-word;
+        }
+
+        .file-actions {
+            margin-top: 15px;
+            display: flex;
+            gap: 10px;
+        }
+
+        .download-btn {
+            padding: 6px 12px;
+            background: #007bff;
+            color: white;
+            border: none;
+            border-radius: 4px;
+            font-size: 12px;
+            cursor: pointer;
+            transition: background 0.2s;
+        }
+
+        .download-btn:hover {
+            background: #0056b3;
+        }
+
+        .open-btn {
+            padding: 6px 12px;
+            background: #667eea;
+            color: white;
+            border: none;
+            border-radius: 4px;
+            font-size: 12px;
+            cursor: pointer;
+            transition: background 0.2s;
+        }
+
+        .open-btn:hover {
+            background: #5568d3;
+        }
+
+        .empty-state {
+            text-align: center;
+            padding: 60px 20px;
+            color: #999;
+        }
+
+        .empty-state-icon {
+            font-size: 64px;
+            margin-bottom: 20px;
+        }
+
+        .empty-state h3 {
+            font-size: 20px;
+            margin-bottom: 10px;
+        }
+
+        .empty-state p {
+            font-size: 14px;
+        }
+
+        .loading {
+            text-align: center;
+            padding: 40px;
+            color: #666;
+        }
+
+        .alert {
+            padding: 12px 20px;
+            border-radius: 6px;
+            margin-bottom: 20px;
+            font-size: 14px;
+        }
+
+        .alert-success {
+            background-color: #d4edda;
+            color: #155724;
+            border: 1px solid #c3e6cb;
+        }
+
+        .alert-error {
+            background-color: #f8d7da;
+            color: #721c24;
+            border: 1px solid #f5c6cb;
+        }
+    </style>
+</head>
+<body>
+    <div class="header">
+        <h1>Collaborative Document Editor</h1>
+        <div class="header-actions">
+            <span class="user-info">Logged in as: <strong id="username"></strong></span>
+            <form action="/logout" method="post" style="margin: 0;">
+                <button type="submit" class="logout-btn">Logout</button>
+            </form>
+        </div>
+    </div>
+
+    <div class="container">
+        <div id="alert-container"></div>
+
+        <div class="toolbar">
+            <div class="upload-section">
+                <label for="fileInput" class="file-input-label">Choose File</label>
+                <input type="file" id="fileInput" accept=".docx,.doc">
+                <span class="selected-file" id="selectedFileName">No file selected</span>
+                <button class="upload-btn" id="uploadBtn" disabled>Upload</button>
+            </div>
+        </div>
+
+        <div id="filesContainer" class="loading">
+            Loading files...
+        </div>
+    </div>
+
+    <script>
+        let selectedFile = null;
+
+        // Fetch current user
+        fetch('/api/files/currentUser')
+            .then(response => response.json())
+            .then(data => {
+                document.getElementById('username').textContent = data.username;
+            })
+            .catch(err => {
+                console.error('Failed to fetch current user:', err);
+                document.getElementById('username').textContent = 'User';
+            });
+
+        // Handle file selection
+        document.getElementById('fileInput').addEventListener('change', function(e) {
+            selectedFile = e.target.files[0];
+            if (selectedFile) {
+                document.getElementById('selectedFileName').textContent = selectedFile.name;
+                document.getElementById('uploadBtn').disabled = false;
+            } else {
+                document.getElementById('selectedFileName').textContent = 'No file selected';
+                document.getElementById('uploadBtn').disabled = true;
+            }
+        });
+
+        // Handle file upload
+        document.getElementById('uploadBtn').addEventListener('click', async function() {
+            if (!selectedFile) return;
+
+            const formData = new FormData();
+            formData.append('file', selectedFile);
+
+            try {
+                const response = await fetch('/api/files/upload', {
+                    method: 'POST',
+                    body: formData
+                });
+
+                if (response.ok) {
+                    showAlert('File uploaded successfully!', 'success');
+                    // Reset file input
+                    document.getElementById('fileInput').value = '';
+                    selectedFile = null;
+                    document.getElementById('selectedFileName').textContent = 'No file selected';
+                    document.getElementById('uploadBtn').disabled = true;
+                    // Reload files
+                    loadFiles();
+                } else {
+                    showAlert('Failed to upload file', 'error');
+                }
+            } catch (error) {
+                console.error('Upload error:', error);
+                showAlert('Error uploading file', 'error');
+            }
+        });
+
+        // Load files from server
+        async function loadFiles() {
+            try {
+                const response = await fetch('/api/files');
+                if (!response.ok) throw new Error('Failed to fetch files');
+
+                const files = await response.json();
+                displayFiles(files);
+            } catch (error) {
+                console.error('Error loading files:', error);
+                document.getElementById('filesContainer').innerHTML =
+                    '<div class="empty-state"><div class="empty-state-icon">⚠️</div><h3>Error loading files</h3></div>';
+            }
+        }
+
+        // Display files in grid
+        function displayFiles(files) {
+            const container = document.getElementById('filesContainer');
+
+            if (files.length === 0) {
+                container.innerHTML = `
+                    <div class="empty-state">
+                        <div class="empty-state-icon">📄</div>
+                        <h3>No documents yet</h3>
+                        <p>Upload a document to get started with collaborative editing</p>
+                    </div>
+                `;
+                return;
+            }
+
+            container.innerHTML = '<div class="files-grid"></div>';
+            const grid = container.querySelector('.files-grid');
+
+            files.forEach(fileName => {
+                const card = document.createElement('div');
+                card.className = 'file-card';
+                card.innerHTML = `
+                    <div class="file-icon">📄</div>
+                    <div class="file-name">${fileName}</div>
+                    <div class="file-actions">
+                        <button class="open-btn" onclick="openEditor('${fileName}')">Open</button>
+                        <button class="download-btn" onclick="downloadFile('${fileName}')">Download</button>
+                    </div>
+                `;
+                grid.appendChild(card);
+            });
+        }
+
+        // Open file in editor
+        function openEditor(fileName) {
+            const roomId = btoa(fileName); // Base64 encode the filename
+            window.location.href = `/editor.html?roomId=${roomId}`;
+        }
+
+        // Download file
+        async function downloadFile(fileName) {
+            try {
+                const response = await fetch(`/api/files/download/${encodeURIComponent(fileName)}`);
+                if (!response.ok) throw new Error('Download failed');
+
+                const blob = await response.blob();
+                const url = window.URL.createObjectURL(blob);
+                const a = document.createElement('a');
+                a.href = url;
+                a.download = fileName;
+                document.body.appendChild(a);
+                a.click();
+                window.URL.revokeObjectURL(url);
+                document.body.removeChild(a);
+            } catch (error) {
+                console.error('Download error:', error);
+                showAlert('Failed to download file', 'error');
+            }
+        }
+
+        // Show alert message
+        function showAlert(message, type) {
+            const container = document.getElementById('alert-container');
+            const alert = document.createElement('div');
+            alert.className = `alert alert-${type}`;
+            alert.textContent = message;
+            container.appendChild(alert);
+
+            setTimeout(() => {
+                alert.remove();
+            }, 5000);
+        }
+
+        // Load files on page load
+        loadFiles();
+    </script>
+</body>
+</html>
