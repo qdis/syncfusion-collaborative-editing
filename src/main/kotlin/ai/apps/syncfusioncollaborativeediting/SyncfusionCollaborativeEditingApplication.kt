@@ -2,10 +2,10 @@
 // ABOUTME: Configures and launches the application with scheduling support
 package ai.apps.syncfusioncollaborativeediting
 
+import com.syncfusion.licensing.SyncfusionLicenseProvider
 import org.springframework.boot.autoconfigure.SpringBootApplication
 import org.springframework.boot.runApplication
 import org.springframework.scheduling.annotation.EnableScheduling
-import com.syncfusion.licensing.SyncfusionLicenseProvider
 
 @SpringBootApplication
 @EnableScheduling

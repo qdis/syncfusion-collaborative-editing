@@ -59,10 +59,12 @@ class MinioService(
 
     fun documentExists(fileName: String): Boolean {
         return try {
-            s3Client.headObject(HeadObjectRequest.builder()
-                .bucket(bucketName)
-                .key(fileName)
-                .build())
+            s3Client.headObject(
+                HeadObjectRequest.builder()
+                    .bucket(bucketName)
+                    .key(fileName)
+                    .build()
+            )
             true
         } catch (e: NoSuchKeyException) {
             false

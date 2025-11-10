@@ -16,11 +16,8 @@ import org.springframework.messaging.handler.annotation.MessageMapping
 import org.springframework.messaging.simp.SimpMessageHeaderAccessor
 import org.springframework.messaging.simp.SimpMessagingTemplate
 import org.springframework.messaging.simp.annotation.SendToUser
-import org.springframework.messaging.simp.stomp.StompHeaderAccessor
 import org.springframework.messaging.support.MessageBuilder
-import org.springframework.messaging.support.MessageHeaderAccessor
 import org.springframework.stereotype.Controller
-import org.springframework.web.socket.messaging.SessionConnectEvent
 import org.springframework.web.socket.messaging.SessionConnectedEvent
 import org.springframework.web.socket.messaging.SessionDisconnectEvent
 import java.security.Principal
@@ -58,7 +55,7 @@ class DocumentEditorHub(
         stringRedisTemplate.opsForHash<String, String>().put("documentMap", sessionId, documentName)
 
         // Add user to presence list
-        val userInfoKey = documentName + CollaborativeEditingHelper.USER_INFO_SUFFIX
+        val userInfoKey = roomId + CollaborativeEditingHelper.USER_INFO_SUFFIX
         val currentUser = principal.map { it.name }.orElse("Anonymous")
         val userAction = ActionInfo().apply {
             connectionId = sessionId
@@ -68,7 +65,7 @@ class DocumentEditorHub(
         val userJson = objectMapper.writeValueAsString(userAction)
         stringRedisTemplate.opsForList().rightPush(userInfoKey, userJson)
 
-        notifyUserJoined(documentName)
+        notifyUserJoined(roomId)
 
         val currentUsers = stringRedisTemplate.opsForList().range(userInfoKey, 0, -1) ?: emptyList()
 
@@ -99,13 +96,14 @@ class DocumentEditorHub(
         // Get the document name for the session
         val documentName = stringRedisTemplate.opsForHash<String, String>().get("documentMap", sessionId)
         if (documentName != null) {
-            notifyUserLeft(documentName, sessionId)
+            val roomId = Base64.getEncoder().encodeToString(documentName.toByteArray())
+            notifyUserLeft(roomId, sessionId)
         }
     }
 
-    private fun notifyUserJoined(documentName: String) {
+    private fun notifyUserJoined(roomId: String) {
         // Get the list of users from Redis using consistent key pattern
-        val userInfoKey = documentName + CollaborativeEditingHelper.USER_INFO_SUFFIX
+        val userInfoKey = roomId + CollaborativeEditingHelper.USER_INFO_SUFFIX
         val userJsonStrings = stringRedisTemplate.opsForList().range(userInfoKey, 0, -1) ?: emptyList()
         val actionsList = userJsonStrings.mapNotNull { userJson ->
             try {
@@ -117,14 +115,12 @@ class DocumentEditorHub(
         }
 
         val addUserHeaders = MessageHeaders(mapOf("action" to "addUser"))
-        logger.info("Broadcasting user joined to document: $documentName with users: ${actionsList.map { it.currentUser }}")
-        // Broadcast to encoded roomId for WebSocket topic routing
-        val roomId = Base64.getEncoder().encodeToString(documentName.toByteArray())
+        logger.info("Broadcasting user joined to room: $roomId with users: ${actionsList.map { it.currentUser }}")
         broadcastToRoom(roomId, actionsList, addUserHeaders)
     }
 
-    private fun notifyUserLeft(documentName: String, sessionId: String) {
-        val userInfoKey = documentName + CollaborativeEditingHelper.USER_INFO_SUFFIX
+    private fun notifyUserLeft(roomId: String, sessionId: String) {
+        val userInfoKey = roomId + CollaborativeEditingHelper.USER_INFO_SUFFIX
         val userJsonStrings = stringRedisTemplate.opsForList().range(userInfoKey, 0, -1) ?: emptyList()
 
         if (userJsonStrings.isNotEmpty()) {
@@ -136,7 +132,6 @@ class DocumentEditorHub(
                         stringRedisTemplate.opsForList().remove(userInfoKey, 1, userJson)
 
                         val removeUserHeaders = MessageHeaders(mapOf("action" to "removeUser"))
-                        val roomId = Base64.getEncoder().encodeToString(documentName.toByteArray())
                         broadcastToRoom(roomId, action, removeUserHeaders)
 
                         // Remove the session ID from the session-document mapping

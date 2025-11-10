@@ -4,7 +4,9 @@ package ai.apps.syncfusioncollaborativeediting.service
 
 import ai.apps.syncfusioncollaborativeediting.helper.CollaborativeEditingHelper
 import ai.apps.syncfusioncollaborativeediting.model.SaveInfo
+import com.fasterxml.jackson.databind.ObjectMapper
 import com.syncfusion.docio.FormatType
+import com.syncfusion.ej2.wordprocessor.ActionInfo
 import com.syncfusion.ej2.wordprocessor.CollaborativeEditingHandler
 import com.syncfusion.ej2.wordprocessor.WordProcessorHelper
 import org.slf4j.LoggerFactory
@@ -14,49 +16,75 @@ import org.springframework.stereotype.Service
 import java.io.ByteArrayInputStream
 import java.io.ByteArrayOutputStream
 import java.nio.charset.StandardCharsets
-import java.util.Base64
+import java.util.*
 import java.util.concurrent.Semaphore
 
 @Service
 class BackgroundService(
     private val minioService: MinioService,
-    private val stringRedisTemplate: StringRedisTemplate
+    private val stringRedisTemplate: StringRedisTemplate,
+    private val objectMapper: ObjectMapper // <— add
 ) {
 
     private val logger = LoggerFactory.getLogger(BackgroundService::class.java)
-    private val itemsToProcess = mutableListOf<SaveInfo>()
     private val semaphore = Semaphore(1)
 
 
-    @Scheduled(fixedRate = 5000) // Runs every 5 seconds
-    fun runBackgroundTask() {
+    // New: run on a configurable cadence (default 5s)
+    @Scheduled(fixedDelayString = "\${collaborative.autosave-interval-ms:5000}")
+    fun periodicAutosave() {
         try {
             semaphore.acquire()
-            synchronized(itemsToProcess) {
-                while (itemsToProcess.isNotEmpty()) {
-                    val item = itemsToProcess.removeAt(0)
-                    logger.info("Processing background save for room: ${item.roomName}")
-                    try {
-                        applyOperationsToSourceDocument(item)
-                        clearRecordsFromRedisCache(item)
-                    } catch (e: Exception) {
-                        logger.error("Error processing save item", e)
-                    }
-                }
+
+            // Find all rooms that currently have an ops list.
+            // Note: KEYS is O(N). See “Caveats” below for SCAN/room index.
+            val opsKeys = stringRedisTemplate
+                .keys("*${CollaborativeEditingHelper.OPS_SUFFIX}")
+                .orEmpty()
+
+            for (opsKey in opsKeys) {
+                val roomName = opsKey.removeSuffix(CollaborativeEditingHelper.OPS_SUFFIX)
+                val actions = fetchUnpersistedActions(roomName)
+                if (actions.isEmpty()) continue
+
+                logger.info("Autosave tick: room=$roomName ops=${actions.size}")
+                // Apply and persist
+                applyOperationsToSourceDocument(SaveInfo(roomName = roomName, actions = actions, partialSave = true))
+                // Advance persisted version and clear to_remove
+                clearRecordsFromRedisCache(SaveInfo(roomName = roomName, actions = actions, partialSave = true))
             }
-        } catch (e: InterruptedException) {
-            logger.error("Background task interrupted", e)
         } finally {
             semaphore.release()
         }
     }
 
-    fun addItemToProcess(item: SaveInfo) {
-        synchronized(itemsToProcess) {
-            itemsToProcess.add(item)
-            logger.info("Added item to process queue. Queue size: ${itemsToProcess.size}")
+    // Collect all actions with version > persisted_version from both queues.
+    private fun fetchUnpersistedActions(roomName: String): List<ActionInfo> {
+        val persistedKey = roomName + CollaborativeEditingHelper.PERSISTED_VERSION_SUFFIX
+        val toRemoveKey = roomName + CollaborativeEditingHelper.TO_REMOVE_SUFFIX
+        val opsKey = roomName + CollaborativeEditingHelper.OPS_SUFFIX
+
+        val persistedVersion = stringRedisTemplate.opsForValue()
+            .get(persistedKey)?.toIntOrNull() ?: 0
+
+        val fromToRemove = stringRedisTemplate.opsForList()
+            .range(toRemoveKey, 0, -1).orEmpty()
+            .map { objectMapper.readValue(it, ActionInfo::class.java) }
+            .filter { it.version > persistedVersion }
+
+        val fromOps = stringRedisTemplate.opsForList()
+            .range(opsKey, 0, -1).orEmpty()
+            .map { objectMapper.readValue(it, ActionInfo::class.java) }
+            .filter { it.version > persistedVersion }
+
+        return buildList {
+            addAll(fromToRemove)
+            addAll(fromOps)
         }
     }
+
+    // keep existing applyOperationsToSourceDocument(...) and clearRecordsFromRedisCache(...)
+
 
     private fun applyOperationsToSourceDocument(workItem: SaveInfo) {
         try {
@@ -82,7 +110,7 @@ class BackgroundService(
             }
 
             // Get the document name (in a real implementation, this should be tracked per room)
-            val fileName = Base64.getDecoder().decode( workItem.roomName).toString(StandardCharsets.UTF_8)
+            val fileName = Base64.getDecoder().decode(workItem.roomName).toString(StandardCharsets.UTF_8)
 
             logger.info("Applying ${toApply.size} operations to document: $fileName in room: ${workItem.roomName} (filtered ${actions.size - toApply.size} already-persisted)")
             // Load the document from MinIO
@@ -96,7 +124,7 @@ class BackgroundService(
             toApply.forEach { info ->
                 try {
                     handler.updateAction(info)
-                }catch (e: Exception){
+                } catch (e: Exception) {
                     logger.error("Error applying action to document: $fileName", e)
                 }
             }
@@ -120,41 +148,55 @@ class BackgroundService(
         }
     }
 
+    // BackgroundService.kt
     private fun clearRecordsFromRedisCache(workItem: SaveInfo) {
         val partialSave = workItem.partialSave
         val roomName = workItem.roomName
         val actions = workItem.actions ?: emptyList()
 
         try {
-            // Calculate highest saved version (assumes actions have version field set)
+            // Highest version that was just saved to MinIO
             val highestVersion = actions.maxOfOrNull { it.version } ?: 0
 
+            val persistedVersionKey = roomName + CollaborativeEditingHelper.PERSISTED_VERSION_SUFFIX
+            val opsKey = roomName + CollaborativeEditingHelper.OPS_SUFFIX
+            val startKey = roomName + CollaborativeEditingHelper.START_SUFFIX
+            val toRemoveKey = roomName + CollaborativeEditingHelper.TO_REMOVE_SUFFIX
+
             if (!partialSave) {
-                // Full save - set persisted version and clear operation keys
-                val persistedVersionKey = roomName + CollaborativeEditingHelper.PERSISTED_VERSION_SUFFIX
+                // Full save: set persisted, clear live window
                 stringRedisTemplate.opsForValue().set(persistedVersionKey, highestVersion.toString())
-
-                val opsKey = roomName + CollaborativeEditingHelper.OPS_SUFFIX
-                val startKey = roomName + CollaborativeEditingHelper.START_SUFFIX
-
                 stringRedisTemplate.delete(opsKey)
                 stringRedisTemplate.delete(startKey)
             } else {
-                // Partial save - update persisted version only
-                val persistedVersionKey = roomName + CollaborativeEditingHelper.PERSISTED_VERSION_SUFFIX
-                val currentPersisted = stringRedisTemplate.opsForValue().get(persistedVersionKey)?.toIntOrNull() ?: 0
-                if (highestVersion > currentPersisted) {
-                    stringRedisTemplate.opsForValue().set(persistedVersionKey, highestVersion.toString())
+                // Partial save: bump persisted_version if advanced
+                val currentPersisted = stringRedisTemplate.opsForValue()
+                    .get(persistedVersionKey)?.toIntOrNull() ?: 0
+                val newPersisted = maxOf(currentPersisted, highestVersion)
+                if (newPersisted > currentPersisted) {
+                    stringRedisTemplate.opsForValue().set(persistedVersionKey, newPersisted.toString())
+                }
+
+                // Trim ops ≤ persisted_version and advance :start accordingly
+                val start = stringRedisTemplate.opsForValue().get(startKey)?.toIntOrNull() ?: 1
+                val len = stringRedisTemplate.opsForList().size(opsKey)?.toInt() ?: 0
+                val toTrim = maxOf(0, minOf(len, newPersisted - start + 1))
+                if (toTrim > 0) {
+                    stringRedisTemplate.opsForList().trim(opsKey, toTrim.toLong(), -1)
+                    stringRedisTemplate.opsForValue().set(startKey, (start + toTrim).toString())
                 }
             }
 
-            // Always clear the to_remove queue after successful save
-            val toRemoveKey = roomName + CollaborativeEditingHelper.TO_REMOVE_SUFFIX
+            // Clear the spillover queue after any successful save
             stringRedisTemplate.delete(toRemoveKey)
 
-            logger.info("Cleared Redis cache for room: $roomName (partialSave: $partialSave, highestVersion: $highestVersion)")
+            logger.info(
+                "Cleared Redis cache for room: $roomName " +
+                        "(partialSave=$partialSave, highestVersion=$highestVersion)"
+            )
         } catch (e: Exception) {
             logger.error("Error clearing Redis cache", e)
         }
     }
+
 }

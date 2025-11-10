@@ -34,10 +34,12 @@ class FileController(
 
         minioService.uploadDocument(fileName, file.inputStream, file.size)
 
-        return ResponseEntity.ok(mapOf(
-            "message" to "File uploaded successfully",
-            "fileName" to fileName
-        ))
+        return ResponseEntity.ok(
+            mapOf(
+                "message" to "File uploaded successfully",
+                "fileName" to fileName
+            )
+        )
     }
 
     @GetMapping("/download/{fileName}")
