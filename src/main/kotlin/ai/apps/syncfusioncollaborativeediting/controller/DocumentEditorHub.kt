@@ -33,10 +33,6 @@ class DocumentEditorHub(
 
     private val logger = LoggerFactory.getLogger(DocumentEditorHub::class.java)
 
-    @Value("\${collaborative.redis-pub-sub-channel}")
-    private lateinit var pubSubChannel: String
-
-
     @MessageMapping("/init")
     @SendToUser("/queue/init")
     fun init(
@@ -64,6 +60,9 @@ class DocumentEditorHub(
         }
         val userJson = objectMapper.writeValueAsString(userAction)
         stringRedisTemplate.opsForList().rightPush(userInfoKey, userJson)
+
+        // Track active room
+        stringRedisTemplate.opsForSet().add("active_rooms", roomId)
 
         notifyUserJoined(roomId)
 
@@ -143,10 +142,12 @@ class DocumentEditorHub(
                 }
             }
 
-            // If no users left, delete the user_info key
+            // If no users left, delete the user_info key and remove from active_rooms
             val remainingUsers = stringRedisTemplate.opsForList().size(userInfoKey) ?: 0
             if (remainingUsers == 0L) {
                 stringRedisTemplate.delete(userInfoKey)
+                stringRedisTemplate.opsForSet().remove("active_rooms", roomId)
+                logger.debug("Room $roomId is now inactive (no users)")
             }
         }
     }
@@ -156,15 +157,5 @@ class DocumentEditorHub(
             "/topic/public/$roomName",
             MessageBuilder.createMessage(payload, headers)
         )
-    }
-
-    fun publishToRedis(roomName: String, payload: Any) {
-        try {
-            val message = objectMapper.writeValueAsString(payload)
-            stringRedisTemplate.convertAndSend(pubSubChannel, message)
-            logger.debug("Message published to Redis: {}", message)
-        } catch (e: Exception) {
-            logger.error("Error publishing to Redis", e)
-        }
     }
 }

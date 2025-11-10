@@ -25,4 +25,4 @@ minio:
 # Collaborative Editing Configuration
 collaborative:
   save-threshold: 150
-  redis-pub-sub-channel: collaborativeediting
+  autosave-interval-ms: 3000

@@ -1,5 +1,5 @@
-// ABOUTME: Integration tests for Redis key structure cutover
-// ABOUTME: Tests trim boundaries, stale clients, concurrent ops, presence, errors, and import deduplication
+// ABOUTME: Integration tests for Redis ZSET+HASH structure with CAS-based operations
+// ABOUTME: Tests version reservation, commit, contiguous ops, autosave snapshot and cleanup
 package ai.apps.syncfusioncollaborativeediting
 
 import ai.apps.syncfusioncollaborativeediting.helper.CollaborativeEditingHelper
@@ -25,11 +25,10 @@ class RedisKeyStructureTest {
     @Autowired
     private lateinit var objectMapper: ObjectMapper
 
-    private val testRoomName = "test-room-redis-keys"
+    private val testRoomName = "test-room-zset-hash"
 
     @BeforeEach
     fun setup() {
-        // Clean up any existing test keys
         cleanupTestKeys()
     }
 
@@ -40,11 +39,13 @@ class RedisKeyStructureTest {
 
     private fun cleanupTestKeys() {
         val keys = listOf(
-            testRoomName + CollaborativeEditingHelper.OPS_SUFFIX,
-            testRoomName + CollaborativeEditingHelper.START_SUFFIX,
-            testRoomName + CollaborativeEditingHelper.TO_REMOVE_SUFFIX,
+            testRoomName + CollaborativeEditingHelper.OPS_HASH_SUFFIX,
+            testRoomName + CollaborativeEditingHelper.OPS_INDEX_SUFFIX,
+            testRoomName + CollaborativeEditingHelper.VERSION_COUNTER_SUFFIX,
             testRoomName + CollaborativeEditingHelper.PERSISTED_VERSION_SUFFIX,
-            testRoomName + CollaborativeEditingHelper.USER_INFO_SUFFIX
+            testRoomName + CollaborativeEditingHelper.USER_INFO_SUFFIX,
+            "dirty_rooms",
+            "active_rooms"
         )
         keys.forEach { stringRedisTemplate.delete(it) }
     }
@@ -53,354 +54,311 @@ class RedisKeyStructureTest {
         val action = ActionInfo()
         action.version = version
         action.roomName = roomName
-        action.isTransformed = false
+        action.isTransformed = true
         return action
     }
 
     @Test
-    fun `test trim boundary - push cacheLimit+5 ops, verify length and start bumped`() {
-        val cacheLimit = 10
-        val opsToAdd = cacheLimit + 5
-
-        val opsKey = testRoomName + CollaborativeEditingHelper.OPS_SUFFIX
-        val startKey = testRoomName + CollaborativeEditingHelper.START_SUFFIX
-        val toRemoveKey = testRoomName + CollaborativeEditingHelper.TO_REMOVE_SUFFIX
+    fun `test RESERVE_VERSION_SCRIPT - allocates sequential versions with placeholders`() {
+        val opsHashKey = testRoomName + CollaborativeEditingHelper.OPS_HASH_SUFFIX
+        val opsIndexKey = testRoomName + CollaborativeEditingHelper.OPS_INDEX_SUFFIX
+        val versionKey = testRoomName + CollaborativeEditingHelper.VERSION_COUNTER_SUFFIX
 
         val script = DefaultRedisScript<List<Any>>()
-        script.setScriptText(CollaborativeEditingHelper.NEW_INSERT_SCRIPT)
+        script.setScriptText(CollaborativeEditingHelper.RESERVE_VERSION_SCRIPT)
         script.resultType = List::class.java as Class<List<Any>>
 
-        // Insert cacheLimit + 5 operations
-        for (i in 0 until opsToAdd) {
-            val action = createDummyAction(i)
-            val serialized = objectMapper.writeValueAsString(action)
-            val keys = listOf(opsKey, startKey, toRemoveKey)
-            val args = listOf(serialized, i.toString(), cacheLimit.toString())
-            stringRedisTemplate.execute(script, keys, *args.toTypedArray())
-        }
+        // Reserve first version
+        val result1 = stringRedisTemplate.execute(
+            script,
+            listOf(opsHashKey, opsIndexKey, versionKey),
+            "0"
+        )!!
 
-        // Verify ops list length is exactly cacheLimit
-        val opsLength = stringRedisTemplate.opsForList().size(opsKey)
-        assertEquals(cacheLimit.toLong(), opsLength, "Ops list should be trimmed to cacheLimit")
+        val version1 = (result1[0] as Number).toInt()
+        assertEquals(1, version1, "First version should be 1")
 
-        // Verify start has been bumped by 5
-        val start = stringRedisTemplate.opsForValue().get(startKey)?.toInt() ?: 1
-        assertEquals(6, start, "Start should be bumped from 1 to 6 (removed 5 ops)")
+        // Verify placeholder exists
+        val placeholder1 = stringRedisTemplate.opsForHash<String, String>().get(opsHashKey, "1")
+        assertEquals("__PENDING__", placeholder1, "Should have placeholder")
 
-        // Verify to_remove contains 5 operations
-        val toRemoveLength = stringRedisTemplate.opsForList().size(toRemoveKey)
-        assertEquals(5L, toRemoveLength, "to_remove should contain 5 trimmed operations")
+        // Reserve second version
+        val result2 = stringRedisTemplate.execute(
+            script,
+            listOf(opsHashKey, opsIndexKey, versionKey),
+            "0"
+        )!!
+
+        val version2 = (result2[0] as Number).toInt()
+        assertEquals(2, version2, "Second version should be 2")
+
+        // Verify counter
+        val counter = stringRedisTemplate.opsForValue().get(versionKey)?.toInt()
+        assertEquals(2, counter, "Version counter should be 2")
     }
 
     @Test
-    fun `test stale client - clientVersion before start triggers resync`() {
-        val cacheLimit = 10
-        val opsKey = testRoomName + CollaborativeEditingHelper.OPS_SUFFIX
-        val startKey = testRoomName + CollaborativeEditingHelper.START_SUFFIX
-        val toRemoveKey = testRoomName + CollaborativeEditingHelper.TO_REMOVE_SUFFIX
+    fun `test COMMIT_TRANSFORMED_SCRIPT - CAS prevents double commit`() {
+        val opsHashKey = testRoomName + CollaborativeEditingHelper.OPS_HASH_SUFFIX
+        val opsIndexKey = testRoomName + CollaborativeEditingHelper.OPS_INDEX_SUFFIX
 
-        val insertScript = DefaultRedisScript<List<Any>>()
-        insertScript.setScriptText(CollaborativeEditingHelper.NEW_INSERT_SCRIPT)
-        insertScript.resultType = List::class.java as Class<List<Any>>
+        val commitScript = DefaultRedisScript<String>()
+        commitScript.setScriptText(CollaborativeEditingHelper.COMMIT_TRANSFORMED_SCRIPT)
+        commitScript.resultType = String::class.java
 
-        // Insert 15 operations to trigger trim (start will move to 6)
-        for (i in 0 until 15) {
-            val action = createDummyAction(i)
-            val serialized = objectMapper.writeValueAsString(action)
-            val keys = listOf(opsKey, startKey, toRemoveKey)
-            val args = listOf(serialized, i.toString(), cacheLimit.toString())
-            stringRedisTemplate.execute(insertScript, keys, *args.toTypedArray())
-        }
+        // Set up a placeholder
+        stringRedisTemplate.opsForHash<String, String>().put(opsHashKey, "1", "__PENDING__")
+        stringRedisTemplate.opsForZSet().add(opsIndexKey, "1", 1.0)
 
-        // Verify start is now 6
-        val start = stringRedisTemplate.opsForValue().get(startKey)?.toInt() ?: 1
-        assertEquals(6, start, "Start should be 6 after trim (removed 5 ops)")
-
-        val pendingScript = DefaultRedisScript<List<Any>>()
-        pendingScript.setScriptText(CollaborativeEditingHelper.NEW_PENDING_SCRIPT)
-        pendingScript.resultType = List::class.java as Class<List<Any>>
-
-        // Test 1: Truly stale client (version 3, which is before start=6)
-        // idx = (3+1) - 6 = -2, which is < 0 → resync
-        val staleClientVersion = 3
-        val keys = listOf(opsKey, startKey)
-        val args = listOf(staleClientVersion.toString())
-
-        val response1 = stringRedisTemplate.execute(pendingScript, keys, *args.toTypedArray())
-        assertNotNull(response1)
-        val resyncFlag1 = when (val flag = response1!![1]) {
-            is Number -> flag.toInt()
-            is String -> flag.toInt()
-            else -> 0
-        }
-        assertEquals(1, resyncFlag1, "Resync flag should be 1 for truly stale client (v3 < start-1)")
-
-        // Test 2: Boundary case - client at start-1 (version 5)
-        // idx = (5+1) - 6 = 0, which is >= 0 → no resync, normal serve
-        val boundaryClientVersion = start - 1
-        val args2 = listOf(boundaryClientVersion.toString())
-
-        val response2 = stringRedisTemplate.execute(pendingScript, keys, *args2.toTypedArray())
-        assertNotNull(response2)
-        val resyncFlag2 = when (val flag = response2!![1]) {
-            is Number -> flag.toInt()
-            is String -> flag.toInt()
-            else -> 0
-        }
-        assertEquals(0, resyncFlag2, "Resync flag should be 0 for boundary client (v${start-1} == start-1)")
-    }
-
-    @Test
-    fun `test concurrent ops around trim - both succeed, transform context includes appended op`() {
-        val cacheLimit = 10
-        val opsKey = testRoomName + CollaborativeEditingHelper.OPS_SUFFIX
-        val startKey = testRoomName + CollaborativeEditingHelper.START_SUFFIX
-        val toRemoveKey = testRoomName + CollaborativeEditingHelper.TO_REMOVE_SUFFIX
-
-        val insertScript = DefaultRedisScript<List<Any>>()
-        insertScript.setScriptText(CollaborativeEditingHelper.NEW_INSERT_SCRIPT)
-        insertScript.resultType = List::class.java as Class<List<Any>>
-
-        // Insert 9 operations (one away from trim)
-        for (i in 0 until 9) {
-            val action = createDummyAction(i)
-            val serialized = objectMapper.writeValueAsString(action)
-            val keys = listOf(opsKey, startKey, toRemoveKey)
-            val args = listOf(serialized, i.toString(), cacheLimit.toString())
-            stringRedisTemplate.execute(insertScript, keys, *args.toTypedArray())
-        }
-
-        // Insert 10th operation (will trigger trim at cacheLimit)
-        val action10 = createDummyAction(9)
-        val serialized10 = objectMapper.writeValueAsString(action10)
-        val keys = listOf(opsKey, startKey, toRemoveKey)
-        val args10 = listOf(serialized10, "9", cacheLimit.toString())
-
-        val response = stringRedisTemplate.execute(insertScript, keys, *args10.toTypedArray())
-
-        assertNotNull(response)
-        val previousOps = response!![1]
-        assertTrue(previousOps is List<*>, "previousOps should be a list")
-
-        val opsList = previousOps as List<*>
-        assertTrue(opsList.isNotEmpty(), "previousOps should not be empty")
-
-        // Verify the last operation in previousOps is the one we just appended
-        val lastOpJson = opsList.last() as String
-        val lastOp = objectMapper.readValue(lastOpJson, ActionInfo::class.java)
-        assertEquals(9, lastOp.version, "Last op in transform context should match appended op")
-    }
-
-    @Test
-    fun `test presence lifecycle - join and leave updates room-user_info, broadcast matches Redis`() {
-        val userInfoKey = testRoomName + CollaborativeEditingHelper.USER_INFO_SUFFIX
-
-        // Simulate user join by adding user to list
-        val user1 = createDummyAction(0)
-        user1.connectionId = "user1-connection"
-        user1.currentUser = "Alice"
-        val user1Json = objectMapper.writeValueAsString(user1)
-
-        stringRedisTemplate.opsForList().rightPush(userInfoKey, user1Json)
-
-        // Verify user is in list
-        val users = stringRedisTemplate.opsForList().range(userInfoKey, 0, -1)
-        assertNotNull(users)
-        assertEquals(1, users!!.size, "Should have 1 user")
-
-        // Simulate user leave by removing user
-        stringRedisTemplate.opsForList().remove(userInfoKey, 1, user1Json)
-
-        // Verify user is removed
-        val usersAfterLeave = stringRedisTemplate.opsForList().range(userInfoKey, 0, -1)
-        assertNotNull(usersAfterLeave)
-        assertEquals(0, usersAfterLeave!!.size, "Should have 0 users after leave")
-    }
-
-    @Test
-    fun `test error path - UPDATE with empty ops returns EMPTY`() {
-        val opsKey = testRoomName + CollaborativeEditingHelper.OPS_SUFFIX
-        val startKey = testRoomName + CollaborativeEditingHelper.START_SUFFIX
-
-        val updateScript = DefaultRedisScript<String>()
-        updateScript.setScriptText(CollaborativeEditingHelper.NEW_UPDATE_SCRIPT)
-        updateScript.resultType = String::class.java
-
-        // Try to update when ops list is empty
         val action = createDummyAction(1)
-        val serialized = objectMapper.writeValueAsString(action)
-        val keys = listOf(opsKey, startKey)
-        val args = listOf(serialized, "1")
+        val actionJson = objectMapper.writeValueAsString(action)
 
-        val result = stringRedisTemplate.execute(updateScript, keys, *args.toTypedArray())
-
-        assertEquals("EMPTY", result, "UPDATE on empty ops should return EMPTY")
-    }
-
-    @Test
-    fun `test import dedupe - persisted_version filters to_remove ops correctly`() {
-        val opsKey = testRoomName + CollaborativeEditingHelper.OPS_SUFFIX
-        val toRemoveKey = testRoomName + CollaborativeEditingHelper.TO_REMOVE_SUFFIX
-        val persistedVersionKey = testRoomName + CollaborativeEditingHelper.PERSISTED_VERSION_SUFFIX
-
-        // Add ops to to_remove queue with explicit versions
-        val oldOp1 = createDummyAction(0)
-        oldOp1.version = 1
-        val oldOp2 = createDummyAction(0)
-        oldOp2.version = 2
-        val oldOp3 = createDummyAction(0)
-        oldOp3.version = 4  // This one is > persistedVersion=3, should be included
-
-        stringRedisTemplate.opsForList().rightPush(toRemoveKey, objectMapper.writeValueAsString(oldOp1))
-        stringRedisTemplate.opsForList().rightPush(toRemoveKey, objectMapper.writeValueAsString(oldOp2))
-        stringRedisTemplate.opsForList().rightPush(toRemoveKey, objectMapper.writeValueAsString(oldOp3))
-
-        // Add current ops to ops queue
-        val currentOp = createDummyAction(0)
-        currentOp.version = 5
-        stringRedisTemplate.opsForList().rightPush(opsKey, objectMapper.writeValueAsString(currentOp))
-
-        // Set persisted_version to 3 (indicating ops 1-3 are already in MinIO)
-        stringRedisTemplate.opsForValue().set(persistedVersionKey, "3")
-
-        // Simulate import logic with version filtering
-        val persistedVersion = stringRedisTemplate.opsForValue().get(persistedVersionKey)?.toIntOrNull() ?: 0
-
-        val actions = mutableListOf<ActionInfo>()
-
-        // Filter to_remove ops by version
-        val toRemoveOps = stringRedisTemplate.opsForList().range(toRemoveKey, 0, -1) ?: emptyList()
-        toRemoveOps.forEach { item ->
-            val action = objectMapper.readValue(item, ActionInfo::class.java)
-            if (action.version > persistedVersion) {
-                actions.add(action)
-            }
-        }
-
-        // Always get current ops
-        val opsValues = stringRedisTemplate.opsForList().range(opsKey, 0, -1) ?: emptyList()
-        opsValues.forEach { item ->
-            actions.add(objectMapper.readValue(item, ActionInfo::class.java))
-        }
-
-        // Verify: should have oldOp3 (v4) and currentOp (v5), but not oldOp1 (v1) or oldOp2 (v2)
-        assertEquals(2, actions.size, "Should have 2 ops: v4 from to_remove and v5 from ops")
-        assertEquals(4, actions[0].version, "First op should be v4 from to_remove")
-        assertEquals(5, actions[1].version, "Second op should be v5 from ops")
-    }
-
-    @Test
-    fun `test NEW_INSERT returns correct version after multiple inserts`() {
-        val cacheLimit = 50
-        val opsKey = testRoomName + CollaborativeEditingHelper.OPS_SUFFIX
-        val startKey = testRoomName + CollaborativeEditingHelper.START_SUFFIX
-        val toRemoveKey = testRoomName + CollaborativeEditingHelper.TO_REMOVE_SUFFIX
-
-        val insertScript = DefaultRedisScript<List<Any>>()
-        insertScript.setScriptText(CollaborativeEditingHelper.NEW_INSERT_SCRIPT)
-        insertScript.resultType = List::class.java as Class<List<Any>>
-
-        // Insert 5 operations
-        val versions = mutableListOf<Int>()
-        for (i in 0 until 5) {
-            val action = createDummyAction(i)
-            val serialized = objectMapper.writeValueAsString(action)
-            val keys = listOf(opsKey, startKey, toRemoveKey)
-            val args = listOf(serialized, i.toString(), cacheLimit.toString())
-
-            val response = stringRedisTemplate.execute(insertScript, keys, *args.toTypedArray())
-            assertNotNull(response)
-
-            val version = response!![0].toString().toInt()
-            versions.add(version)
-        }
-
-        // Verify versions are sequential: 1, 2, 3, 4, 5
-        assertEquals(listOf(1, 2, 3, 4, 5), versions, "Versions should be sequential starting from 1")
-    }
-
-    @Test
-    fun `test duplicate-save coalescing - saver filters by persisted_version`() {
-        val persistedVersionKey = testRoomName + CollaborativeEditingHelper.PERSISTED_VERSION_SUFFIX
-
-        // Set persisted_version to 3 (ops 1-3 already saved)
-        stringRedisTemplate.opsForValue().set(persistedVersionKey, "3")
-
-        // Create actions with versions 1, 2, 4, 5 (simulating duplicate save bundle)
-        val actions = listOf(
-            createDummyAction(0).apply { version = 1 },
-            createDummyAction(0).apply { version = 2 },
-            createDummyAction(0).apply { version = 4 },
-            createDummyAction(0).apply { version = 5 }
+        // First commit should succeed
+        val status1 = stringRedisTemplate.execute(
+            commitScript,
+            listOf(opsHashKey, opsIndexKey),
+            actionJson,
+            "1"
         )
+        assertEquals("OK", status1, "First commit should succeed")
 
-        // Simulate saver's filtering logic
-        val persistedVersion = stringRedisTemplate.opsForValue().get(persistedVersionKey)?.toIntOrNull() ?: 0
-        val toApply = actions.filter { it.version > persistedVersion }
-
-        // Verify only versions > 3 are included
-        assertEquals(2, toApply.size, "Should filter to 2 ops (v4, v5)")
-        assertEquals(4, toApply[0].version, "First op should be v4")
-        assertEquals(5, toApply[1].version, "Second op should be v5")
+        // Second commit should fail (CAS)
+        val status2 = stringRedisTemplate.execute(
+            commitScript,
+            listOf(opsHashKey, opsIndexKey),
+            actionJson,
+            "1"
+        )
+        assertEquals("VERSION_CONFLICT", status2, "Second commit should fail CAS check")
     }
 
     @Test
-    fun `test presence join path - user written to user_info on init`() {
-        val userInfoKey = testRoomName + CollaborativeEditingHelper.USER_INFO_SUFFIX
+    fun `test GET_PENDING_SCRIPT - returns contiguous ops only`() {
+        val opsHashKey = testRoomName + CollaborativeEditingHelper.OPS_HASH_SUFFIX
+        val opsIndexKey = testRoomName + CollaborativeEditingHelper.OPS_INDEX_SUFFIX
+        val persistedKey = testRoomName + CollaborativeEditingHelper.PERSISTED_VERSION_SUFFIX
 
-        // Simulate user join by adding user to list (as done in init())
-        val user1 = createDummyAction(0)
-        user1.connectionId = "session-123"
-        user1.currentUser = "Alice"
-        user1.roomName = testRoomName
-        val user1Json = objectMapper.writeValueAsString(user1)
+        // Set persisted version to 0
+        stringRedisTemplate.opsForValue().set(persistedKey, "0")
 
-        stringRedisTemplate.opsForList().rightPush(userInfoKey, user1Json)
-
-        // Verify user is in list
-        val users = stringRedisTemplate.opsForList().range(userInfoKey, 0, -1)
-        assertNotNull(users)
-        assertEquals(1, users!!.size, "Should have 1 user in presence list")
-
-        val retrievedUser = objectMapper.readValue(users[0], ActionInfo::class.java)
-        assertEquals("session-123", retrievedUser.connectionId, "Connection ID should match")
-        assertEquals("Alice", retrievedUser.currentUser, "Current user should match")
-    }
-
-    @Test
-    fun `test schedule-only-on-trim - removed count triggers auto-save`() {
-        val cacheLimit = 10
-        val opsKey = testRoomName + CollaborativeEditingHelper.OPS_SUFFIX
-        val startKey = testRoomName + CollaborativeEditingHelper.START_SUFFIX
-        val toRemoveKey = testRoomName + CollaborativeEditingHelper.TO_REMOVE_SUFFIX
-
-        val insertScript = DefaultRedisScript<List<Any>>()
-        insertScript.setScriptText(CollaborativeEditingHelper.NEW_INSERT_SCRIPT)
-        insertScript.resultType = List::class.java as Class<List<Any>>
-
-        // Insert operations and track removed counts
-        val removedCounts = mutableListOf<Int>()
-        for (i in 0 until 15) {
+        // Set up ops: committed 1, 2, 3, pending 4, committed 5
+        for (i in 1..5) {
             val action = createDummyAction(i)
-            val serialized = objectMapper.writeValueAsString(action)
-            val keys = listOf(opsKey, startKey, toRemoveKey)
-            val args = listOf(serialized, i.toString(), cacheLimit.toString())
-
-            val response = stringRedisTemplate.execute(insertScript, keys, *args.toTypedArray())
-            assertNotNull(response)
-
-            val removedCount = response!![2].toString().toInt()
-            removedCounts.add(removedCount)
+            val json = if (i == 4) "__PENDING__" else objectMapper.writeValueAsString(action)
+            stringRedisTemplate.opsForHash<String, String>().put(opsHashKey, i.toString(), json)
+            stringRedisTemplate.opsForZSet().add(opsIndexKey, i.toString(), i.toDouble())
         }
 
-        // First 10 inserts should have removed=0 (no trim)
-        for (i in 0 until 10) {
-            assertEquals(0, removedCounts[i], "Insert $i should have removed=0 (no trim yet)")
+        val script = DefaultRedisScript<List<Any>>()
+        script.setScriptText(CollaborativeEditingHelper.GET_PENDING_SCRIPT)
+        script.resultType = List::class.java as Class<List<Any>>
+
+        // Client at version 0 should get ops 1, 2, 3 (stops at pending 4)
+        val result = stringRedisTemplate.execute(
+            script,
+            listOf(opsHashKey, opsIndexKey, persistedKey),
+            "0"
+        )!!
+
+        val opsData = result[0] as List<*>
+        val resyncFlag = (result[1] as Number).toInt()
+
+        assertEquals(3, opsData.size, "Should return 3 contiguous ops (stops at pending)")
+        assertEquals(0, resyncFlag, "Should not need resync")
+    }
+
+    @Test
+    fun `test GET_PENDING_SCRIPT - returns resync flag for stale client`() {
+        val opsHashKey = testRoomName + CollaborativeEditingHelper.OPS_HASH_SUFFIX
+        val opsIndexKey = testRoomName + CollaborativeEditingHelper.OPS_INDEX_SUFFIX
+        val persistedKey = testRoomName + CollaborativeEditingHelper.PERSISTED_VERSION_SUFFIX
+
+        // Set persisted version to 10
+        stringRedisTemplate.opsForValue().set(persistedKey, "10")
+
+        // Client at version 5 is stale
+        val script = DefaultRedisScript<List<Any>>()
+        script.setScriptText(CollaborativeEditingHelper.GET_PENDING_SCRIPT)
+        script.resultType = List::class.java as Class<List<Any>>
+
+        val result = stringRedisTemplate.execute(
+            script,
+            listOf(opsHashKey, opsIndexKey, persistedKey),
+            "5"
+        )!!
+
+        val opsData = result[0] as List<*>
+        val resyncFlag = (result[1] as Number).toInt()
+        val windowStart = (result[2] as Number).toInt()
+
+        assertEquals(0, opsData.size, "Stale client should get empty ops")
+        assertEquals(1, resyncFlag, "Should need resync")
+        assertEquals(11, windowStart, "Window starts after persisted version")
+    }
+
+    @Test
+    fun `test AUTOSAVE_SNAPSHOT_SCRIPT - returns pending versions`() {
+        val opsHashKey = testRoomName + CollaborativeEditingHelper.OPS_HASH_SUFFIX
+        val opsIndexKey = testRoomName + CollaborativeEditingHelper.OPS_INDEX_SUFFIX
+        val persistedKey = testRoomName + CollaborativeEditingHelper.PERSISTED_VERSION_SUFFIX
+
+        // Set persisted version to 5
+        stringRedisTemplate.opsForValue().set(persistedKey, "5")
+
+        // Add ops 6, 7, 8
+        for (i in 6..8) {
+            val action = createDummyAction(i)
+            stringRedisTemplate.opsForHash<String, String>().put(
+                opsHashKey,
+                i.toString(),
+                objectMapper.writeValueAsString(action)
+            )
+            stringRedisTemplate.opsForZSet().add(opsIndexKey, i.toString(), i.toDouble())
         }
 
-        // Inserts 11-15 should have removed > 0 (trim triggered)
-        for (i in 10 until 15) {
-            assertTrue(removedCounts[i] > 0, "Insert $i should have removed > 0 (trim triggered)")
+        val script = DefaultRedisScript<List<Any>>()
+        script.setScriptText(CollaborativeEditingHelper.AUTOSAVE_SNAPSHOT_SCRIPT)
+        script.resultType = List::class.java as Class<List<Any>>
+
+        val result = stringRedisTemplate.execute(
+            script,
+            listOf(opsIndexKey, persistedKey),
+            "1000"
+        )!!
+
+        val persistedVersion = (result[0] as Number).toInt()
+        val versions = result[1] as List<*>
+
+        assertEquals(5, persistedVersion, "Should return current persisted version")
+        assertEquals(3, versions.size, "Should return 3 pending versions")
+        assertEquals("6", versions[0].toString())
+        assertEquals("8", versions[2].toString())
+    }
+
+    @Test
+    fun `test AUTOSAVE_CLEANUP_SCRIPT - CAS advances persisted version and deletes ops`() {
+        val opsHashKey = testRoomName + CollaborativeEditingHelper.OPS_HASH_SUFFIX
+        val opsIndexKey = testRoomName + CollaborativeEditingHelper.OPS_INDEX_SUFFIX
+        val persistedKey = testRoomName + CollaborativeEditingHelper.PERSISTED_VERSION_SUFFIX
+
+        // Set persisted version to 5
+        stringRedisTemplate.opsForValue().set(persistedKey, "5")
+
+        // Add ops 1-8
+        for (i in 1..8) {
+            val action = createDummyAction(i)
+            stringRedisTemplate.opsForHash<String, String>().put(
+                opsHashKey,
+                i.toString(),
+                objectMapper.writeValueAsString(action)
+            )
+            stringRedisTemplate.opsForZSet().add(opsIndexKey, i.toString(), i.toDouble())
         }
+
+        val script = DefaultRedisScript<Long>()
+        script.setScriptText(CollaborativeEditingHelper.AUTOSAVE_CLEANUP_SCRIPT)
+        script.resultType = Long::class.java
+
+        // Cleanup up to version 7
+        val finalPersisted = stringRedisTemplate.execute(
+            script,
+            listOf(opsHashKey, opsIndexKey, persistedKey),
+            "7",
+            "5"
+        )!!
+
+        assertEquals(7L, finalPersisted, "Should advance to version 7")
+
+        // Verify ops 1-7 are deleted
+        val remaining = stringRedisTemplate.opsForZSet().size(opsIndexKey)
+        assertEquals(1L, remaining, "Should have 1 remaining op (version 8)")
+
+        // Verify persisted version updated
+        val persisted = stringRedisTemplate.opsForValue().get(persistedKey)?.toInt()
+        assertEquals(7, persisted, "Persisted version should be 7")
+    }
+
+    @Test
+    fun `test AUTOSAVE_CLEANUP_SCRIPT - CAS fails if expected version mismatch`() {
+        val opsHashKey = testRoomName + CollaborativeEditingHelper.OPS_HASH_SUFFIX
+        val opsIndexKey = testRoomName + CollaborativeEditingHelper.OPS_INDEX_SUFFIX
+        val persistedKey = testRoomName + CollaborativeEditingHelper.PERSISTED_VERSION_SUFFIX
+
+        // Set persisted version to 10 (someone else already advanced it)
+        stringRedisTemplate.opsForValue().set(persistedKey, "10")
+
+        val script = DefaultRedisScript<Long>()
+        script.setScriptText(CollaborativeEditingHelper.AUTOSAVE_CLEANUP_SCRIPT)
+        script.resultType = Long::class.java
+
+        // Try to cleanup expecting version 5, but it's actually 10
+        val finalPersisted = stringRedisTemplate.execute(
+            script,
+            listOf(opsHashKey, opsIndexKey, persistedKey),
+            "7",
+            "5"
+        )!!
+
+        assertEquals(10L, finalPersisted, "Should return actual persisted version (CAS failed)")
+
+        // Verify persisted version unchanged
+        val persisted = stringRedisTemplate.opsForValue().get(persistedKey)?.toInt()
+        assertEquals(10, persisted, "Persisted version should remain 10")
+    }
+
+    @Test
+    fun `test sequential operations maintain monotonic versions`() {
+        val opsHashKey = testRoomName + CollaborativeEditingHelper.OPS_HASH_SUFFIX
+        val opsIndexKey = testRoomName + CollaborativeEditingHelper.OPS_INDEX_SUFFIX
+        val versionKey = testRoomName + CollaborativeEditingHelper.VERSION_COUNTER_SUFFIX
+
+        val reserveScript = DefaultRedisScript<List<Any>>()
+        reserveScript.setScriptText(CollaborativeEditingHelper.RESERVE_VERSION_SCRIPT)
+        reserveScript.resultType = List::class.java as Class<List<Any>>
+
+        val commitScript = DefaultRedisScript<String>()
+        commitScript.setScriptText(CollaborativeEditingHelper.COMMIT_TRANSFORMED_SCRIPT)
+        commitScript.resultType = String::class.java
+
+        // Reserve and commit 10 operations
+        for (i in 1..10) {
+            val result = stringRedisTemplate.execute(
+                reserveScript,
+                listOf(opsHashKey, opsIndexKey, versionKey),
+                (i - 1).toString()
+            )!!
+
+            val version = (result[0] as Number).toInt()
+            assertEquals(i, version, "Version should be sequential")
+
+            val action = createDummyAction(version)
+            val status = stringRedisTemplate.execute(
+                commitScript,
+                listOf(opsHashKey, opsIndexKey),
+                objectMapper.writeValueAsString(action),
+                version.toString()
+            )
+            assertEquals("OK", status, "Commit should succeed")
+        }
+
+        // Verify all versions exist
+        val allVersions = stringRedisTemplate.opsForZSet().range(opsIndexKey, 0, -1)
+        assertEquals(10, allVersions?.size, "Should have 10 versions")
+        assertEquals(setOf("1", "2", "3", "4", "5", "6", "7", "8", "9", "10"), allVersions)
+    }
+
+    @Test
+    fun `test dirty_rooms tracking`() {
+        // Add room to dirty set
+        stringRedisTemplate.opsForSet().add("dirty_rooms", testRoomName)
+
+        val members = stringRedisTemplate.opsForSet().members("dirty_rooms")
+        assertTrue(members?.contains(testRoomName) == true, "Room should be in dirty set")
+
+        // Remove room from dirty set
+        stringRedisTemplate.opsForSet().remove("dirty_rooms", testRoomName)
+
+        val membersAfter = stringRedisTemplate.opsForSet().members("dirty_rooms")
+        assertFalse(membersAfter?.contains(testRoomName) == true, "Room should not be in dirty set")
     }
 }
