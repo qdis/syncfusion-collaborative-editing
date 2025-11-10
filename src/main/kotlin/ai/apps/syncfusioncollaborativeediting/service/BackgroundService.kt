@@ -29,6 +29,55 @@ class BackgroundService(
     private val logger = LoggerFactory.getLogger(BackgroundService::class.java)
     private val semaphore = Semaphore(1)
 
+
+    // Add new scheduled method
+    @Scheduled(fixedDelayString = "\${collaborative.room-cleanup-interval-ms:30000}")
+    fun cleanupInactiveRooms() {
+        try {
+            val activeRooms = stringRedisTemplate.opsForSet().members("active_rooms") ?: return
+
+            for (roomName in activeRooms) {
+                val userInfoKey = roomName + CollaborativeEditingHelper.USER_INFO_SUFFIX
+                val userCount = stringRedisTemplate.opsForList().size(userInfoKey) ?: 0
+
+                if (userCount == 0L) {
+                    // Room has no users, check last activity
+                    val opsIndexKey = roomName + CollaborativeEditingHelper.OPS_INDEX_SUFFIX
+                    val lastOp = stringRedisTemplate.opsForZSet()
+                        .reverseRange(opsIndexKey, 0, 0)
+                        ?.firstOrNull()
+
+                    if (lastOp == null) {
+                        // No ops and no users - mark for cleanup
+                        cleanupRoomKeys(roomName)
+                    }
+                }
+            }
+        } catch (e: Exception) {
+            logger.error("Room cleanup failed", e)
+        }
+    }
+
+    private fun cleanupRoomKeys(roomName: String) {
+        // Only cleanup if autosaved and no pending ops
+        val opsIndexKey = roomName + CollaborativeEditingHelper.OPS_INDEX_SUFFIX
+        val opsCount = stringRedisTemplate.opsForZSet().size(opsIndexKey) ?: 0
+
+        if (opsCount == 0L) {
+            val keys = listOf(
+                roomName + CollaborativeEditingHelper.OPS_HASH_SUFFIX,
+                roomName + CollaborativeEditingHelper.OPS_INDEX_SUFFIX,
+                roomName + CollaborativeEditingHelper.VERSION_COUNTER_SUFFIX,
+                roomName + CollaborativeEditingHelper.PERSISTED_VERSION_SUFFIX,
+                roomName + CollaborativeEditingHelper.USER_INFO_SUFFIX
+            )
+            stringRedisTemplate.delete(keys)
+            stringRedisTemplate.opsForSet().remove("active_rooms", roomName)
+            stringRedisTemplate.opsForSet().remove("dirty_rooms", roomName)
+            logger.info("Cleaned up inactive room: $roomName")
+        }
+    }
+
     @Scheduled(fixedDelayString = "\${collaborative.autosave-interval-ms:3000}")
     fun periodicAutosave() {
         try {
@@ -73,18 +122,24 @@ class BackgroundService(
             return
         }
 
-        // Fetch payloads
-        val payloads = stringRedisTemplate.opsForHash<String, String>()
-            .multiGet(opsHashKey, versions)
-            .filterNotNull()
-            .filter { it != "__PENDING__" }
+        // Fetch payloads and build contiguous committed prefix
+        val raw = stringRedisTemplate.opsForHash<String, String>()
+            .multiGet(opsHashKey, versions)  // aligned with 'versions' order
 
-        if (payloads.isEmpty()) {
-            logger.debug("All ops still pending for $roomName")
+        val committedPrefix = ArrayList<String>()
+        for (i in versions.indices) {
+            val v = raw[i]
+            if (v == null || v == "__PENDING__") break
+            committedPrefix.add(v)
+        }
+
+        if (committedPrefix.isEmpty()) {
+            logger.debug("All ops still pending or first gap not closed for $roomName")
             return
         }
 
-        val actions = payloads.map { objectMapper.readValue(it, ActionInfo::class.java) }
+        val actions = committedPrefix.map { objectMapper.readValue(it, ActionInfo::class.java) }
+        // Safe: contiguous prefix, so max is the new persisted tip
         val highestVersion = actions.maxOf { it.version }
 
         logger.info("Autosaving ${actions.size} ops for $roomName (${persistedVersion + 1} to $highestVersion)")
@@ -122,12 +177,9 @@ class BackgroundService(
 
     private fun applyOperationsToMinIO(fileName: String, actions: List<ActionInfo>): Boolean {
         return try {
-            // Transform untransformed operations
-            val actionsArrayList = ArrayList(actions)
-            actions.forEach { action ->
-                if (!action.isTransformed) {
-                    CollaborativeEditingHandler.transformOperation(action, actionsArrayList)
-                }
+            // All ops from Redis should already be transformed
+            require(actions.all { it.isTransformed }) {
+                "All operations should be transformed before reaching autosave"
             }
 
             // Load document from MinIO

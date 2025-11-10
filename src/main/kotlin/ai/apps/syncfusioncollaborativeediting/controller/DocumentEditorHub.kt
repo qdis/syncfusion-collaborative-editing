@@ -130,8 +130,14 @@ class DocumentEditorHub(
                         // Remove the user from the user list
                         stringRedisTemplate.opsForList().remove(userInfoKey, 1, userJson)
 
+                        // Fetch remaining users and broadcast full list
+                        val remainingUserJsons = stringRedisTemplate.opsForList().range(userInfoKey, 0, -1) ?: emptyList()
+                        val actionsList = remainingUserJsons.map { json ->
+                            objectMapper.readValue(json, ActionInfo::class.java)
+                        }
+
                         val removeUserHeaders = MessageHeaders(mapOf("action" to "removeUser"))
-                        broadcastToRoom(roomId, action, removeUserHeaders)
+                        broadcastToRoom(roomId, actionsList, removeUserHeaders)
 
                         // Remove the session ID from the session-document mapping
                         stringRedisTemplate.opsForHash<String, String>().delete("documentMap", sessionId)

@@ -63,6 +63,7 @@ class RedisKeyStructureTest {
         val opsHashKey = testRoomName + CollaborativeEditingHelper.OPS_HASH_SUFFIX
         val opsIndexKey = testRoomName + CollaborativeEditingHelper.OPS_INDEX_SUFFIX
         val versionKey = testRoomName + CollaborativeEditingHelper.VERSION_COUNTER_SUFFIX
+        val persistedKey = testRoomName + CollaborativeEditingHelper.PERSISTED_VERSION_SUFFIX
 
         val script = DefaultRedisScript<List<Any>>()
         script.setScriptText(CollaborativeEditingHelper.RESERVE_VERSION_SCRIPT)
@@ -71,7 +72,7 @@ class RedisKeyStructureTest {
         // Reserve first version
         val result1 = stringRedisTemplate.execute(
             script,
-            listOf(opsHashKey, opsIndexKey, versionKey),
+            listOf(opsHashKey, opsIndexKey, versionKey, persistedKey),
             "0"
         )!!
 
@@ -85,7 +86,7 @@ class RedisKeyStructureTest {
         // Reserve second version
         val result2 = stringRedisTemplate.execute(
             script,
-            listOf(opsHashKey, opsIndexKey, versionKey),
+            listOf(opsHashKey, opsIndexKey, versionKey, persistedKey),
             "0"
         )!!
 
@@ -101,6 +102,7 @@ class RedisKeyStructureTest {
     fun `test COMMIT_TRANSFORMED_SCRIPT - CAS prevents double commit`() {
         val opsHashKey = testRoomName + CollaborativeEditingHelper.OPS_HASH_SUFFIX
         val opsIndexKey = testRoomName + CollaborativeEditingHelper.OPS_INDEX_SUFFIX
+        val persistedKey = testRoomName + CollaborativeEditingHelper.PERSISTED_VERSION_SUFFIX
 
         val commitScript = DefaultRedisScript<String>()
         commitScript.setScriptText(CollaborativeEditingHelper.COMMIT_TRANSFORMED_SCRIPT)
@@ -116,7 +118,7 @@ class RedisKeyStructureTest {
         // First commit should succeed
         val status1 = stringRedisTemplate.execute(
             commitScript,
-            listOf(opsHashKey, opsIndexKey),
+            listOf(opsHashKey, opsIndexKey, persistedKey),
             actionJson,
             "1"
         )
@@ -125,7 +127,7 @@ class RedisKeyStructureTest {
         // Second commit should fail (CAS)
         val status2 = stringRedisTemplate.execute(
             commitScript,
-            listOf(opsHashKey, opsIndexKey),
+            listOf(opsHashKey, opsIndexKey, persistedKey),
             actionJson,
             "1"
         )
@@ -311,6 +313,7 @@ class RedisKeyStructureTest {
         val opsHashKey = testRoomName + CollaborativeEditingHelper.OPS_HASH_SUFFIX
         val opsIndexKey = testRoomName + CollaborativeEditingHelper.OPS_INDEX_SUFFIX
         val versionKey = testRoomName + CollaborativeEditingHelper.VERSION_COUNTER_SUFFIX
+        val persistedKey = testRoomName + CollaborativeEditingHelper.PERSISTED_VERSION_SUFFIX
 
         val reserveScript = DefaultRedisScript<List<Any>>()
         reserveScript.setScriptText(CollaborativeEditingHelper.RESERVE_VERSION_SCRIPT)
@@ -324,7 +327,7 @@ class RedisKeyStructureTest {
         for (i in 1..10) {
             val result = stringRedisTemplate.execute(
                 reserveScript,
-                listOf(opsHashKey, opsIndexKey, versionKey),
+                listOf(opsHashKey, opsIndexKey, versionKey, persistedKey),
                 (i - 1).toString()
             )!!
 
@@ -334,7 +337,7 @@ class RedisKeyStructureTest {
             val action = createDummyAction(version)
             val status = stringRedisTemplate.execute(
                 commitScript,
-                listOf(opsHashKey, opsIndexKey),
+                listOf(opsHashKey, opsIndexKey, persistedKey),
                 objectMapper.writeValueAsString(action),
                 version.toString()
             )

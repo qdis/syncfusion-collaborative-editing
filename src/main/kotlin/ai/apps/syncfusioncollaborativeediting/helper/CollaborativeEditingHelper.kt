@@ -15,14 +15,20 @@ object CollaborativeEditingHelper {
      * Reserve version and placeholder, return contiguous committed ops for transform.
      * This prevents version gaps by reserving slots with __PENDING__ markers.
      *
-     * KEYS: [opsHashKey, opsIndexKey, versionKey]
+     * KEYS: [opsHashKey, opsIndexKey, versionKey, persistedKey]
      * ARGV: [clientVersion]
      *
-     * Returns: [newVersion, opsData[]]
+     * Returns: [newVersion, opsData[]] or ["STALE_CLIENT", persistedVersion]
      */
     const val RESERVE_VERSION_SCRIPT = """
-        local opsHashKey, opsIndexKey, versionKey = KEYS[1], KEYS[2], KEYS[3]
+        local opsHashKey, opsIndexKey, versionKey, persistedKey = KEYS[1], KEYS[2], KEYS[3], KEYS[4]
         local clientVersion = tonumber(ARGV[1])
+
+        -- Check if client is stale (before persisted window)
+        local persistedVersion = tonumber(redis.call('GET', persistedKey) or "0")
+        if clientVersion < persistedVersion then
+            return {"STALE_CLIENT", persistedVersion}
+        end
 
         -- Allocate new version
         local newVersion = redis.call('INCR', versionKey)
@@ -51,17 +57,91 @@ object CollaborativeEditingHelper {
     """
 
     /**
-     * Commit transformed op with CAS check.
-     * Only succeeds if slot is still pending (hasn't been taken by another process).
+     * Delete a pending slot when abandoning a CAS retry.
+     * Removes the __PENDING__ placeholder from both hash and index.
      *
      * KEYS: [opsHashKey, opsIndexKey]
+     * ARGV: [version]
+     *
+     * Returns: "DELETED"
+     */
+    const val DELETE_PENDING_SLOT_SCRIPT = """
+        local opsHashKey, opsIndexKey = KEYS[1], KEYS[2]
+        local version = ARGV[1]
+
+        redis.call('HDEL', opsHashKey, version)
+        redis.call('ZREM', opsIndexKey, version)
+
+        return 'DELETED'
+    """
+
+    /**
+     * Re-fetch contiguous committed ops between clientVersion and targetVersion.
+     * Used during CAS retries to get newly committed ops without allocating a new version.
+     *
+     * KEYS: [opsHashKey, opsIndexKey]
+     * ARGV: [clientVersion, targetVersion]
+     *
+     * Returns: opsData[]
+     */
+    const val REFETCH_OPS_SCRIPT = """
+        local opsHashKey, opsIndexKey = KEYS[1], KEYS[2]
+        local clientVersion, targetVersion = tonumber(ARGV[1]), tonumber(ARGV[2])
+
+        local versions = redis.call('ZRANGEBYSCORE', opsIndexKey, clientVersion + 1, targetVersion - 1)
+        local result = {}
+        local expect = clientVersion + 1
+
+        for _, v in ipairs(versions) do
+            local ver = tonumber(v)
+            if ver ~= expect then break end  -- Gap found, stop
+
+            local data = redis.call('HGET', opsHashKey, v)
+            if data == '__PENDING__' or not data then break end  -- Not committed yet
+
+            table.insert(result, data)
+            expect = expect + 1
+        end
+
+        return result
+    """
+
+    /**
+     * Commit transformed op with CAS check and contiguity verification.
+     * Only succeeds if slot is still pending and all prior versions are committed.
+     *
+     * KEYS: [opsHashKey, opsIndexKey, persistedKey]
      * ARGV: [transformedJson, version]
      *
-     * Returns: "OK" or "VERSION_CONFLICT"
+     * Returns: "OK", "VERSION_CONFLICT", "GAP_BEFORE", or "PENDING_BEFORE"
      */
     const val COMMIT_TRANSFORMED_SCRIPT = """
-        local opsHashKey, opsIndexKey = KEYS[1], KEYS[2]
+        local opsHashKey, opsIndexKey, persistedKey = KEYS[1], KEYS[2], KEYS[3]
         local transformedJson, version = ARGV[1], tonumber(ARGV[2])
+
+        -- Ensure all versions between persisted_version+1 and version-1 are contiguous and committed
+        local persisted = tonumber(redis.call('GET', persistedKey) or "0")
+        local start = persisted + 1
+        local last = version - 1
+
+        if last >= start then
+            local versions = redis.call('ZRANGEBYSCORE', opsIndexKey, start, last)
+            local expect = start
+            for _, v in ipairs(versions) do
+                local ver = tonumber(v)
+                if ver ~= expect then
+                    return 'GAP_BEFORE'
+                end
+                local data = redis.call('HGET', opsHashKey, v)
+                if not data or data == '__PENDING__' then
+                    return 'PENDING_BEFORE'
+                end
+                expect = expect + 1
+            end
+            if expect ~= version then
+                return 'GAP_BEFORE'
+            end
+        end
 
         -- CAS: verify slot is still pending
         local current = redis.call('HGET', opsHashKey, tostring(version))
