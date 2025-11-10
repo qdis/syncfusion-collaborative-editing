@@ -63,17 +63,28 @@ class BackgroundService(
             val actions = workItem.actions ?: return
             if (actions.isEmpty()) return
 
-            // Transform any untransformed actions
-            actions.forEach { action ->
+            // Filter out already-persisted actions for idempotency
+            val persistedKey = workItem.roomName + CollaborativeEditingHelper.PERSISTED_VERSION_SUFFIX
+            val persistedVersion = stringRedisTemplate.opsForValue().get(persistedKey)?.toIntOrNull() ?: 0
+            val toApply = actions.filter { it.version > persistedVersion }
+
+            if (toApply.isEmpty()) {
+                logger.info("All actions already persisted for room: ${workItem.roomName}, skipping")
+                return
+            }
+
+            // Transform only untransformed actions
+            val actionsArrayList = ArrayList(toApply)
+            toApply.forEach { action ->
                 if (!action.isTransformed) {
-                    CollaborativeEditingHandler.transformOperation(action, ArrayList(actions))
+                    CollaborativeEditingHandler.transformOperation(action, actionsArrayList)
                 }
             }
 
             // Get the document name (in a real implementation, this should be tracked per room)
             val fileName = Base64.getDecoder().decode( workItem.roomName).toString(StandardCharsets.UTF_8)
 
-            logger.info("Applying ${actions.size} operations to document: $fileName in room: ${workItem.roomName}")
+            logger.info("Applying ${toApply.size} operations to document: $fileName in room: ${workItem.roomName} (filtered ${actions.size - toApply.size} already-persisted)")
             // Load the document from MinIO
             val documentData = minioService.downloadDocument(fileName)
             val document = ByteArrayInputStream(documentData.readAllBytes()).use { stream ->
@@ -82,7 +93,7 @@ class BackgroundService(
 
             // Apply all actions to the document
             val handler = CollaborativeEditingHandler(document)
-            actions.forEach { info ->
+            toApply.forEach { info ->
                 try {
                     handler.updateAction(info)
                 }catch (e: Exception){
@@ -100,7 +111,7 @@ class BackgroundService(
             // Upload the updated document back to MinIO
             minioService.uploadDocument(fileName, data)
 
-            logger.info("Successfully saved ${actions.size} operations to document: $fileName")
+            logger.info("Successfully saved ${toApply.size} operations to document: $fileName")
 
             outputStream.close()
         } catch (e: Exception) {
@@ -112,18 +123,36 @@ class BackgroundService(
     private fun clearRecordsFromRedisCache(workItem: SaveInfo) {
         val partialSave = workItem.partialSave
         val roomName = workItem.roomName
+        val actions = workItem.actions ?: emptyList()
 
         try {
-            if (!partialSave) {
-                // Full save - clear all room-related keys
-                stringRedisTemplate.delete(roomName)
-                stringRedisTemplate.delete(roomName + CollaborativeEditingHelper.REVISION_INFO_SUFFIX)
-                stringRedisTemplate.delete(roomName + CollaborativeEditingHelper.VERSION_INFO_SUFFIX)
-            }
-            // Always clear the actions to remove queue
-            stringRedisTemplate.delete(roomName + CollaborativeEditingHelper.ACTIONS_TO_REMOVE_SUFFIX)
+            // Calculate highest saved version (assumes actions have version field set)
+            val highestVersion = actions.maxOfOrNull { it.version } ?: 0
 
-            logger.info("Cleared Redis cache for room: $roomName (partialSave: $partialSave)")
+            if (!partialSave) {
+                // Full save - set persisted version and clear operation keys
+                val persistedVersionKey = roomName + CollaborativeEditingHelper.PERSISTED_VERSION_SUFFIX
+                stringRedisTemplate.opsForValue().set(persistedVersionKey, highestVersion.toString())
+
+                val opsKey = roomName + CollaborativeEditingHelper.OPS_SUFFIX
+                val startKey = roomName + CollaborativeEditingHelper.START_SUFFIX
+
+                stringRedisTemplate.delete(opsKey)
+                stringRedisTemplate.delete(startKey)
+            } else {
+                // Partial save - update persisted version only
+                val persistedVersionKey = roomName + CollaborativeEditingHelper.PERSISTED_VERSION_SUFFIX
+                val currentPersisted = stringRedisTemplate.opsForValue().get(persistedVersionKey)?.toIntOrNull() ?: 0
+                if (highestVersion > currentPersisted) {
+                    stringRedisTemplate.opsForValue().set(persistedVersionKey, highestVersion.toString())
+                }
+            }
+
+            // Always clear the to_remove queue after successful save
+            val toRemoveKey = roomName + CollaborativeEditingHelper.TO_REMOVE_SUFFIX
+            stringRedisTemplate.delete(toRemoveKey)
+
+            logger.info("Cleared Redis cache for room: $roomName (partialSave: $partialSave, highestVersion: $highestVersion)")
         } catch (e: Exception) {
             logger.error("Error clearing Redis cache", e)
         }

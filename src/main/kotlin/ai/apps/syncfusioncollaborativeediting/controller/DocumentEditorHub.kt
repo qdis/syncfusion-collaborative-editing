@@ -23,6 +23,7 @@ import org.springframework.stereotype.Controller
 import org.springframework.web.socket.messaging.SessionConnectEvent
 import org.springframework.web.socket.messaging.SessionConnectedEvent
 import org.springframework.web.socket.messaging.SessionDisconnectEvent
+import java.security.Principal
 import java.util.*
 
 
@@ -43,8 +44,9 @@ class DocumentEditorHub(
     @SendToUser("/queue/init")
     fun init(
         @Header(SimpMessageHeaderAccessor.SESSION_ID_HEADER) sessionId: String,
-        @Header(name = "x-room-id", required = false) roomId: String?
-    ): Message<Map<String, String>> {
+        @Header(name = "x-room-id", required = false) roomId: String?,
+        principal: Optional<Principal>
+    ): Message<Map<String, Any>> {
 
         logger.info("WebSocket connection initialized: $sessionId for room ID: $roomId")
         if (roomId == null) {
@@ -54,9 +56,29 @@ class DocumentEditorHub(
         }
         val documentName = String(Base64.getDecoder().decode(roomId))
         stringRedisTemplate.opsForHash<String, String>().put("documentMap", sessionId, documentName)
-        notifyUserJoined(roomId)
 
-        return MessageBuilder.createMessage(mapOf("connectionId" to sessionId), MessageHeaders(mapOf("action" to "connectionId")))
+        // Add user to presence list
+        val userInfoKey = documentName + CollaborativeEditingHelper.USER_INFO_SUFFIX
+        val currentUser = principal.map { it.name }.orElse("Anonymous")
+        val userAction = ActionInfo().apply {
+            connectionId = sessionId
+            this.currentUser = currentUser
+            this.roomName = roomId
+        }
+        val userJson = objectMapper.writeValueAsString(userAction)
+        stringRedisTemplate.opsForList().rightPush(userInfoKey, userJson)
+
+        notifyUserJoined(documentName)
+
+        val currentUsers = stringRedisTemplate.opsForList().range(userInfoKey, 0, -1) ?: emptyList()
+
+        return MessageBuilder.createMessage(
+            mapOf(
+                "connectionId" to sessionId,
+                "users" to currentUsers.map { objectMapper.readValue(it, ActionInfo::class.java) }
+            ),
+            MessageHeaders(mapOf("action" to "connectionId"))
+        )
 
     }
 
@@ -75,16 +97,16 @@ class DocumentEditorHub(
         logger.info("WebSocket connection closed: $sessionId")
 
         // Get the document name for the session
-        val docName = stringRedisTemplate.opsForHash<String, String>().get("documentMap", sessionId)
-        if (docName != null) {
-            val openedDocName = docName + CollaborativeEditingHelper.USER_INFO_SUFFIX
-            notifyUserLeft(docName, openedDocName, sessionId)
+        val documentName = stringRedisTemplate.opsForHash<String, String>().get("documentMap", sessionId)
+        if (documentName != null) {
+            notifyUserLeft(documentName, sessionId)
         }
     }
 
-    private fun notifyUserJoined(roomId: String) {
-        // Get the list of users from Redis
-        val userJsonStrings = stringRedisTemplate.opsForList().range(roomId, 0, -1) ?: emptyList()
+    private fun notifyUserJoined(documentName: String) {
+        // Get the list of users from Redis using consistent key pattern
+        val userInfoKey = documentName + CollaborativeEditingHelper.USER_INFO_SUFFIX
+        val userJsonStrings = stringRedisTemplate.opsForList().range(userInfoKey, 0, -1) ?: emptyList()
         val actionsList = userJsonStrings.mapNotNull { userJson ->
             try {
                 objectMapper.readValue(userJson, ActionInfo::class.java)
@@ -95,13 +117,15 @@ class DocumentEditorHub(
         }
 
         val addUserHeaders = MessageHeaders(mapOf("action" to "addUser"))
-        logger.info("Broadcasting user joined to room: $roomId with users: ${actionsList.map { it.currentUser }}")
+        logger.info("Broadcasting user joined to document: $documentName with users: ${actionsList.map { it.currentUser }}")
+        // Broadcast to encoded roomId for WebSocket topic routing
+        val roomId = Base64.getEncoder().encodeToString(documentName.toByteArray())
         broadcastToRoom(roomId, actionsList, addUserHeaders)
     }
 
-    private fun notifyUserLeft(roomName: String, docName: String, sessionId: String) {
-        // Get the user list from Redis
-        val userJsonStrings = stringRedisTemplate.opsForList().range(docName, 0, -1) ?: emptyList()
+    private fun notifyUserLeft(documentName: String, sessionId: String) {
+        val userInfoKey = documentName + CollaborativeEditingHelper.USER_INFO_SUFFIX
+        val userJsonStrings = stringRedisTemplate.opsForList().range(userInfoKey, 0, -1) ?: emptyList()
 
         if (userJsonStrings.isNotEmpty()) {
             for (userJson in userJsonStrings) {
@@ -109,10 +133,11 @@ class DocumentEditorHub(
                     val action = objectMapper.readValue(userJson, ActionInfo::class.java)
                     if (action.connectionId == sessionId) {
                         // Remove the user from the user list
-                        stringRedisTemplate.opsForList().remove(docName, 1, userJson)
+                        stringRedisTemplate.opsForList().remove(userInfoKey, 1, userJson)
 
                         val removeUserHeaders = MessageHeaders(mapOf("action" to "removeUser"))
-                        broadcastToRoom(roomName, action, removeUserHeaders)
+                        val roomId = Base64.getEncoder().encodeToString(documentName.toByteArray())
+                        broadcastToRoom(roomId, action, removeUserHeaders)
 
                         // Remove the session ID from the session-document mapping
                         stringRedisTemplate.opsForHash<String, String>().delete("documentMap", sessionId)
@@ -123,10 +148,10 @@ class DocumentEditorHub(
                 }
             }
 
-            // If no users left, delete the document key
-            val remainingUsers = stringRedisTemplate.opsForList().size(docName) ?: 0
+            // If no users left, delete the user_info key
+            val remainingUsers = stringRedisTemplate.opsForList().size(userInfoKey) ?: 0
             if (remainingUsers == 0L) {
-                stringRedisTemplate.delete(docName)
+                stringRedisTemplate.delete(userInfoKey)
             }
         }
     }

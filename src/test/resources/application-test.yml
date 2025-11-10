@@ -1,0 +1,28 @@
+spring:
+  application:
+    name: syncfusion-collaborative-editing-test
+
+  # Redis Configuration for tests
+  data:
+    redis:
+      host: localhost
+      port: 6379
+      password:
+      timeout: 60000
+
+# Server Configuration for tests
+server:
+  port: 0  # Random port for tests
+
+# MinIO (S3-compatible) Configuration for tests
+minio:
+  endpoint: http://localhost:9000
+  access-key: minioadmin
+  secret-key: minioadmin
+  bucket-name: syncfusion-documents-test
+  region: us-east-1
+
+# Collaborative Editing Configuration for tests
+collaborative:
+  save-threshold: 10  # Lower threshold for faster test execution
+  redis-pub-sub-channel: collaborativeediting-test

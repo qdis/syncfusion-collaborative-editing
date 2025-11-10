@@ -8,133 +8,102 @@ object CollaborativeEditingHelper {
     // If we reach this limit, we will save the operations to source document.
     const val SAVE_THRESHOLD = 25
 
-    // Suffix key to store version information in redis cache.
-    const val VERSION_INFO_SUFFIX = "_version_info"
+    // Redis key patterns using colon-based namespacing
+    const val OPS_SUFFIX = ":ops"
+    const val START_SUFFIX = ":start"
+    const val TO_REMOVE_SUFFIX = ":to_remove"
+    const val PERSISTED_VERSION_SUFFIX = ":persisted_version"
+    const val USER_INFO_SUFFIX = ":user_info"
 
-    // Suffix key to store revision information in redis cache.
-    const val REVISION_INFO_SUFFIX = "_revision_info"
+    /**
+     * Atomically inserts a new operation and manages cache lifecycle.
+     *
+     * KEYS: [opsKey, startKey, toRemoveKey]
+     * ARGV: [itemJson, clientVersion, cacheLimit]
+     *
+     * Returns: [newVersion, previousOps, removedCount]
+     */
+    const val NEW_INSERT_SCRIPT = """
+        local opsKey, startKey, toRemoveKey = KEYS[1], KEYS[2], KEYS[3]
+        local itemJson, clientVersion, cacheLimit =
+          ARGV[1], tonumber(ARGV[2]), tonumber(ARGV[3])
 
-    // Suffix key to store user information in redis cache.
-    const val USER_INFO_SUFFIX = "_user_info"
+        local start = tonumber(redis.call('GET', startKey) or "1")
+        local len = redis.call('LLEN', opsKey)
+        local newVersion = start + len
 
-    // Suffix key to store removed actions information in redis cache.
-    const val ACTIONS_TO_REMOVE_SUFFIX = "_actions_to_remove"
+        redis.call('RPUSH', opsKey, itemJson)
 
-    // Lua script for inserting operations atomically with version management
-    const val INSERT_SCRIPT = """
-        -- Define keys for version, list, and revision
-        local versionKey = KEYS[1]
-        local listKey = KEYS[2]
-        local revisionKey = KEYS[3]
-        local updateKey = KEYS[4]
-        -- Define arguments: item to insert, client's version, and threshold for cache
-        local item = ARGV[1]
-        local clientVersion = tonumber(ARGV[2])
-        local threshold = tonumber(ARGV[3])
-        -- Increment the version for each operation
-        local version = redis.call('INCR', versionKey)
-        -- Retrieve the current revision, or initialize it if it doesn't exist
-        local revision = redis.call('GET', revisionKey)
-        if not revision then
-            redis.call('SET', revisionKey, '0')
-            revision = 0
-        else
-            revision = tonumber(revision)
+        -- Client wants ops AFTER their version
+        local idx = (clientVersion + 1) - start
+        if idx < 0 then idx = 0 end
+
+        local previous = redis.call('LRANGE', opsKey, idx, -1)
+
+        -- Trim logic: if length exceeds cache limit, move oldest ops to to_remove queue
+        local removed = 0
+        len = len + 1
+        if len > cacheLimit then
+          removed = len - cacheLimit
+          local chunk = redis.call('LRANGE', opsKey, 0, removed - 1)
+          for i=1,#chunk do redis.call('RPUSH', toRemoveKey, chunk[i]) end
+          redis.call('LTRIM', opsKey, removed, -1)
+          redis.call('SET', startKey, start + removed)
         end
-        -- Calculate the effective version by multiplying revision by threshold
-        local effectiveVersion = revision * threshold
-        -- Adjust clientVersion based on effectiveVersion
-        clientVersion = clientVersion - effectiveVersion
-        -- Add the new item to the list and get the new length
-        local length = redis.call('RPUSH', listKey, item)
-        -- Retrieve operations since the client's version
-        local previousOps = redis.call('LRANGE', listKey, clientVersion, -1)
-        -- Define a limit for cache based on threshold
-        local cacheLimit = threshold * 2;
-        local elementToRemove = nil
-        -- If the length of the list reaches the cache limit, trim the list
-        if length % cacheLimit == 0 then
-            elementToRemove = redis.call('LRANGE', listKey, 0, threshold - 1)
-            redis.call('LTRIM', listKey, threshold, -1)
-            -- Increment the revision after trimming
-            redis.call('INCR', revisionKey)
-            -- Add elements to remove to updateKey
-            for _, v in ipairs(elementToRemove) do
-                redis.call('RPUSH', updateKey, v)
-            end
-        end
-        -- Return the current version, operations since client's version, and elements removed
-        local values = {version, previousOps, elementToRemove}
-        return values
+
+        return { newVersion, previous, removed }
     """
 
-    // Lua script for updating a record at a specific position
-    const val UPDATE_RECORD = """
-        -- Define keys for list and revision
-        local listKey = KEYS[1]
-        local revisionKey = KEYS[2]
-        -- Define arguments: item to insert, client's version, and threshold for cache
-        local item = ARGV[1]
-        local clientVersion = ARGV[2]
-        local threshold = tonumber(ARGV[3])
-        -- Retrieve the current revision from Redis, or initialize it if it doesn't exist
-        local revision = redis.call('GET', revisionKey)
-        if not revision then
-            revision = 0
-        else
-            revision = tonumber(revision)
-        end
-        -- Calculate the effective version by multiplying revision by threshold
-        local effectiveVersion = revision * threshold
-        -- Adjust clientVersion based on effectiveVersion
-        clientVersion = tonumber(clientVersion) - effectiveVersion
-        -- Update the list at the position calculated by the adjusted clientVersion
-        -- This effectively 'inserts' the item into the list at the position reflecting the client's view of the list
-        redis.call('LSET', listKey, clientVersion, item)
+    /**
+     * Updates an operation at a specific position after transformation.
+     *
+     * KEYS: [opsKey, startKey]
+     * ARGV: [itemJson, prevVersion]
+     *
+     * Returns: "OK" or "EMPTY"
+     */
+    const val NEW_UPDATE_SCRIPT = """
+        local opsKey, startKey = KEYS[1], KEYS[2]
+        local itemJson, prevVersion = ARGV[1], tonumber(ARGV[2])
+
+        local start = tonumber(redis.call('GET', startKey) or "1")
+        local len = redis.call('LLEN', opsKey)
+
+        if len == 0 then return "EMPTY" end
+
+        local idx = prevVersion - start
+        if idx < 0 then idx = 0 end
+        if idx >= len then idx = len - 1 end
+
+        redis.call('LSET', opsKey, idx, itemJson)
+        return "OK"
     """
 
-    // Lua script for fetching effective pending operations for a client
-    const val EFFECTIVE_PENDING_OPERATIONS = """
-        -- Define the keys for accessing the list and revision in Redis
-        local listKey = KEYS[1]
-        local revisionKey = KEYS[2]
-        -- Convert the first argument to a number to represent the client's version
-        local clientVersion = tonumber(ARGV[1])
-        -- Convert the second argument to a number for the threshold value
-        local threshold = tonumber(ARGV[2])
-        -- Retrieve the current revision number from Redis
-        local revision = redis.call('GET', revisionKey)
-        if not revision then
-            revision = 0
-        else
-            revision = tonumber(revision)
-        end
-        -- Calculate the effective version by multiplying the revision number by the threshold
-        -- This helps in determining the actual version of the document considering the revisions
-        local effectiveVersion = revision * threshold
-        -- Adjust the client's version by subtracting the effective version
-        -- This calculation aligns the client's version with the server's version, accounting for any revisions
-        clientVersion = clientVersion - effectiveVersion
-        -- Return a range of list elements starting from the adjusted client version to the end of the list
-        -- This command retrieves all operations that have occurred since the client's last known state
-        if clientVersion >= 0 then
-            return redis.call('LRANGE', listKey, clientVersion, -1)
-        else
-            return {}
-        end
-    """
+    /**
+     * Fetches pending operations for a client since their last known version.
+     *
+     * KEYS: [opsKey, startKey]
+     * ARGV: [clientVersion]
+     *
+     * Returns: [ops, resyncFlag]
+     *   resyncFlag = 1 if client is stale (before window start)
+     *   resyncFlag = 0 if client is within window
+     */
+    const val NEW_PENDING_SCRIPT = """
+        local opsKey, startKey = KEYS[1], KEYS[2]
+        local clientVersion = tonumber(ARGV[1] or "0")
 
-    // Lua script for fetching pending operations including those being processed
-    const val PENDING_OPERATIONS = """
-        local listKey = KEYS[1]
-        local processingKey = KEYS[2]
-        local startIndex = tonumber(ARGV[1])
-        local endIndex = tonumber(ARGV[2])
-        -- Fetch the list of operations from the listKey
-        local listValues = redis.call('LRANGE', listKey, startIndex, endIndex)
-        -- Fetch the list of operations from the processingKey
-        local processingValues = redis.call('LRANGE', processingKey, startIndex, endIndex)
-        -- Return both lists as a combined result
-        return {processingValues, listValues}
+        local start = tonumber(redis.call('GET', startKey) or "1")
+
+        -- Client wants ops AFTER their version
+        local idx = (clientVersion + 1) - start
+
+        if idx < 0 then
+          -- Client is before the window; full window + resync
+          return { redis.call('LRANGE', opsKey, 0, -1), 1 }
+        else
+          -- Client is within or ahead of window - return ops from their position
+          return { redis.call('LRANGE', opsKey, idx, -1), 0 }
+        end
     """
 }

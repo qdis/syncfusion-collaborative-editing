@@ -36,18 +36,22 @@ class CollaborativeEditingController(
 
             val document = getDocumentFromMinIO(file.fileName)
 
-            // Get the list of pending operations for the document
-            val actions = getPendingOperations(file.roomName, 0, -1)
-            if (!actions.isNullOrEmpty()) {
+            // Get pending operations, filtering out persisted ones
+            val actions = getPendingOperations(file.roomName)
+            if (actions.isNotEmpty()) {
                 // If there are any pending actions, update the document with these actions
                 document.updateActions(actions)
             }
 
-            logger.info("Imported file: ${file.fileName} for room: ${file.roomName} with ${actions?.size ?: 0} pending actions")
+            logger.info("Imported file: ${file.fileName} for room: ${file.roomName} with ${actions.size} pending actions")
 
-            // Get the current version directly from Redis
-            val versionKey = file.roomName + CollaborativeEditingHelper.VERSION_INFO_SUFFIX
-            val currentVersion = stringRedisTemplate.opsForValue().get(versionKey)?.toIntOrNull() ?: 0
+            // Calculate current version: start + length - 1 (or 0 if no ops)
+            val startKey = file.roomName + CollaborativeEditingHelper.START_SUFFIX
+            val opsKey = file.roomName + CollaborativeEditingHelper.OPS_SUFFIX
+
+            val start = stringRedisTemplate.opsForValue().get(startKey)?.toIntOrNull() ?: 1
+            val length = stringRedisTemplate.opsForList().size(opsKey)?.toInt() ?: 0
+            val currentVersion = if (length > 0) start + length - 1 else 0
 
             // Serialize the updated document to SFDT format
             val sfdtString = WordProcessorHelper.serialize(document)
@@ -65,212 +69,234 @@ class CollaborativeEditingController(
     fun updateAction(@RequestBody param: ActionInfo): ActionInfo {
         logger.info("Received UpdateAction request for room: ${param.roomName}, version: ${param.version}")
         val roomName = param.roomName
-        val transformedAction = addOperationsToCache(param)
 
-        val action = mapOf("action" to "updateAction")
-        documentEditorHub.publishToRedis(roomName, transformedAction)
-        documentEditorHub.broadcastToRoom(roomName, transformedAction, MessageHeaders(action))
+        return try {
+            val transformedAction = addOperationsToCache(param)
 
-        return transformedAction
+            // Broadcast only after successful UPDATE
+            val action = mapOf("action" to "updateAction")
+            documentEditorHub.publishToRedis(roomName, transformedAction)
+            documentEditorHub.broadcastToRoom(roomName, transformedAction, MessageHeaders(action))
+
+            transformedAction
+        } catch (e: Exception) {
+            logger.error("Error in UpdateAction - returning 409 Conflict", e)
+            throw org.springframework.web.server.ResponseStatusException(
+                org.springframework.http.HttpStatus.CONFLICT,
+                "Operation update failed: ${e.message}"
+            )
+        }
     }
 
     @PostMapping("/api/collaborativeediting/GetActionsFromServer")
     fun getActionsFromServer(@RequestBody param: ActionInfo): String {
         return try {
             val roomName = param.roomName
-            val lastSyncedVersion = param.version
-            var clientVersion = param.version
+            val clientVersion = param.version
 
-            // Fetch actions that are effective and pending based on the last synced version
-            val actions = getEffectivePendingVersion(roomName, lastSyncedVersion)
-            val currentAction = mutableListOf<ActionInfo>()
+            // Fetch operations since client's version with resync flag
+            val (actions, needsResync) = getPendingOperationsSince(roomName, clientVersion)
 
-            for (action in actions) {
-                // Increment the version for each action sequentially
-                action.version = ++clientVersion
-
-                // Filter actions to only include those that are newer than the client's last known version
-                if (action.version > lastSyncedVersion) {
-                    // Transform actions that have not been transformed yet
-                    if (!action.isTransformed) {
-                        CollaborativeEditingHandler.transformOperation(action, ArrayList(actions))
-                    }
-                    currentAction.add(action)
+            // Transform untransformed operations
+            actions.forEach { action ->
+                if (!action.isTransformed) {
+                    CollaborativeEditingHandler.transformOperation(action, ArrayList(actions))
                 }
             }
 
-            // Serialize the filtered and transformed actions to JSON and return
-            objectMapper.writeValueAsString(currentAction)
+            // Build response with resync flag if needed
+            val response = mutableMapOf<String, Any>(
+                "operations" to actions
+            )
+            if (needsResync) {
+                response["resync"] = true
+            }
+
+            objectMapper.writeValueAsString(response)
         } catch (ex: Exception) {
             logger.error("Error getting actions from server", ex)
-            "{}"
+            """{"operations":[],"resync":false}"""
         }
     }
 
-    private fun getPendingOperations(listKey: String, startIndex: Int, endIndex: Int): List<ActionInfo>? {
+    private fun getPendingOperations(roomName: String): List<ActionInfo> {
         return try {
-            val script = DefaultRedisScript<List<Any>>()
-            script.setScriptText(CollaborativeEditingHelper.PENDING_OPERATIONS)
-            script.resultType = List::class.java as Class<List<Any>>
+            val opsKey = roomName + CollaborativeEditingHelper.OPS_SUFFIX
+            val toRemoveKey = roomName + CollaborativeEditingHelper.TO_REMOVE_SUFFIX
+            val persistedVersionKey = roomName + CollaborativeEditingHelper.PERSISTED_VERSION_SUFFIX
 
-            val keys = listOf(listKey, listKey + CollaborativeEditingHelper.ACTIONS_TO_REMOVE_SUFFIX)
-            val args = listOf(startIndex.toString(), endIndex.toString())
+            val persistedVersion = stringRedisTemplate.opsForValue().get(persistedVersionKey)?.toIntOrNull() ?: 0
 
-            val response = stringRedisTemplate.execute(script, keys, *args.toTypedArray())
             val actions = mutableListOf<ActionInfo>()
 
-            response?.forEach { result ->
-                if (result is List<*>) {
-                    result.forEach { item ->
-                        if (item is String) {
-                            actions.add(objectMapper.readValue(item, ActionInfo::class.java))
-                        }
-                    }
+            // Get to_remove ops and filter by persisted_version
+            val toRemoveOps = stringRedisTemplate.opsForList().range(toRemoveKey, 0, -1) ?: emptyList()
+            toRemoveOps.forEach { item ->
+                val action = objectMapper.readValue(item, ActionInfo::class.java)
+                // Only include ops not yet persisted to MinIO
+                if (action.version > persistedVersion) {
+                    actions.add(action)
                 }
+            }
+
+            // Always get ops from the main queue
+            val opsValues = stringRedisTemplate.opsForList().range(opsKey, 0, -1) ?: emptyList()
+            opsValues.forEach { item ->
+                actions.add(objectMapper.readValue(item, ActionInfo::class.java))
             }
 
             actions
         } catch (ex: Exception) {
             logger.error("Error getting pending operations", ex)
-            null
+            emptyList()
         }
     }
 
-    private fun getEffectivePendingVersion(roomName: String, lastSyncedVersion: Int): List<ActionInfo> {
+    private fun getPendingOperationsSince(roomName: String, clientVersion: Int): Pair<List<ActionInfo>, Boolean> {
         val script = DefaultRedisScript<List<Any>>()
-        script.setScriptText(CollaborativeEditingHelper.EFFECTIVE_PENDING_OPERATIONS)
+        script.setScriptText(CollaborativeEditingHelper.NEW_PENDING_SCRIPT)
         script.resultType = List::class.java as Class<List<Any>>
 
-        val keys = listOf(roomName, roomName + CollaborativeEditingHelper.REVISION_INFO_SUFFIX)
-        val args = listOf(lastSyncedVersion.toString(), CollaborativeEditingHelper.SAVE_THRESHOLD.toString())
+        val opsKey = roomName + CollaborativeEditingHelper.OPS_SUFFIX
+        val startKey = roomName + CollaborativeEditingHelper.START_SUFFIX
+        val keys = listOf(opsKey, startKey)
+        val args = listOf(clientVersion.toString())
 
         val response = stringRedisTemplate.execute(script, keys, *args.toTypedArray())
-        val actions = mutableListOf<ActionInfo>()
+            ?: return Pair(emptyList(), false)
 
-        response?.forEach { result ->
-            if (result is String) {
-                actions.add(objectMapper.readValue(result, ActionInfo::class.java))
+        val actions = mutableListOf<ActionInfo>()
+        var resyncFlag = false
+
+        if (response.size >= 2) {
+            // First element is the operations list
+            val opsData = response[0]
+            if (opsData is List<*>) {
+                opsData.forEach { item ->
+                    if (item is String) {
+                        actions.add(objectMapper.readValue(item, ActionInfo::class.java))
+                    }
+                }
+            }
+
+            // Second element is the resync flag (1 = needs resync, 0 = normal)
+            val flagValue = response[1]
+            resyncFlag = when (flagValue) {
+                is Number -> flagValue.toInt() == 1
+                is String -> flagValue.toIntOrNull() == 1
+                else -> false
             }
         }
 
-        return actions
+        return Pair(actions, resyncFlag)
     }
 
     private fun addOperationsToCache(action: ActionInfo): ActionInfo {
-        var updatedAction = action
         val clientVersion = action.version
         val serializedAction = objectMapper.writeValueAsString(action)
         val roomName = action.roomName
 
-        // Define the keys for Redis operations based on the action's room name
-        val keys = listOf(
-            roomName + CollaborativeEditingHelper.VERSION_INFO_SUFFIX,
-            roomName,
-            roomName + CollaborativeEditingHelper.REVISION_INFO_SUFFIX,
-            roomName + CollaborativeEditingHelper.ACTIONS_TO_REMOVE_SUFFIX
-        )
+        val opsKey = roomName + CollaborativeEditingHelper.OPS_SUFFIX
+        val startKey = roomName + CollaborativeEditingHelper.START_SUFFIX
+        val toRemoveKey = roomName + CollaborativeEditingHelper.TO_REMOVE_SUFFIX
 
-        // Prepare values for the Redis script
-        val values = listOf(
-            serializedAction,
-            clientVersion.toString(),
-            CollaborativeEditingHelper.SAVE_THRESHOLD.toString()
-        )
+        val keys = listOf(opsKey, startKey, toRemoveKey)
+        val cacheLimit = (CollaborativeEditingHelper.SAVE_THRESHOLD * 2).toString()
+        val values = listOf(serializedAction, clientVersion.toString(), cacheLimit)
 
         try {
-            val script = DefaultRedisScript<List<Any>>()
-            script.setScriptText(CollaborativeEditingHelper.INSERT_SCRIPT)
-            script.resultType = List::class.java as Class<List<Any>>
+            // Call NEW_INSERT_SCRIPT to atomically append operation and get previous ops
+            val insertScript = DefaultRedisScript<List<Any>>()
+            insertScript.setScriptText(CollaborativeEditingHelper.NEW_INSERT_SCRIPT)
+            insertScript.resultType = List::class.java as Class<List<Any>>
 
-            val response = stringRedisTemplate.execute(script, keys, *values.toTypedArray())
+            val response = stringRedisTemplate.execute(insertScript, keys, *values.toTypedArray())
+                ?: throw IllegalStateException("INSERT script returned null")
 
-            response.let { results ->
-                // Parse the version number from the script results
-                val version = results[0].toString().toInt()
+            // Parse results: [newVersion, previousOps, removedCount]
+            val serverVersion = response[0].toString().toInt()
+            val removedCount = response[2].toString().toInt()
 
-                // Deserialize the list of previous operations from the script results
-                val previousOperations = mutableListOf<ActionInfo>()
-                val data = results[1]
-                if (data is List<*>) {
-                    data.forEach { result ->
-                        if (result is String) {
-                            previousOperations.add(objectMapper.readValue(result, ActionInfo::class.java))
-                        }
+            val previousOperations = mutableListOf<ActionInfo>()
+            val data = response[1]
+            if (data is List<*>) {
+                data.forEach { result ->
+                    if (result is String) {
+                        previousOperations.add(objectMapper.readValue(result, ActionInfo::class.java))
                     }
-                }
-
-                // Increment the version for each previous operation
-                previousOperations.forEach { op -> op.version += 1 }
-
-                // Check if there are multiple previous operations to determine if transformation is needed
-                if (previousOperations.size > 1) {
-                    // Set the current action to the last operation in the list
-                    updatedAction = previousOperations[previousOperations.size - 1]
-                    val operationsArrayList = ArrayList(previousOperations)
-                    previousOperations.forEach { op ->
-                        // Transform operations that have not been transformed yet
-                        val operation = op.operations
-                        if (operation != null && !op.isTransformed) {
-                            CollaborativeEditingHandler.transformOperation(op, operationsArrayList)
-                        }
-                    }
-                }
-
-                // Update the action's version and mark it as transformed
-                updatedAction.version = version
-                updatedAction.isTransformed = true
-
-                // Update the record in the cache with the new version
-                updateRecordToCache(version, updatedAction)
-
-                // Check if there are cleared operations to be saved
-                if (results.size > 2 && results[2] != null) {
-                    @Suppress("UNCHECKED_CAST")
-                    autoSaveChangesToSourceDocument(results[2] as List<Any>, updatedAction)
                 }
             }
+
+            // Transform the operation against previousOps if needed
+            // Note: previousOps includes the just-appended op due to RPUSH before LRANGE
+            var updatedAction = previousOperations.last()
+            if (previousOperations.size > 1) {
+                val operationsArrayList = ArrayList(previousOperations)
+                previousOperations.forEach { op ->
+                    if (op.operations != null && !op.isTransformed) {
+                        CollaborativeEditingHandler.transformOperation(op, operationsArrayList)
+                    }
+                }
+                updatedAction = previousOperations.last()
+            }
+
+            updatedAction.version = serverVersion
+            updatedAction.isTransformed = true
+
+            // Call NEW_UPDATE_SCRIPT to persist the transformed operation
+            val updateResult = updateRecordToCache(serverVersion, updatedAction)
+            if (updateResult != "OK") {
+                logger.error("UPDATE script failed: $updateResult")
+                throw IllegalStateException("Failed to update operation in cache: $updateResult")
+            }
+
+            // Only schedule auto-save if this operation actually triggered a trim
+            if (removedCount > 0) {
+                val trimmedOps = stringRedisTemplate.opsForList().range(toRemoveKey, 0, -1) ?: emptyList()
+                val actions = trimmedOps.mapNotNull { operation ->
+                    if (operation is String) {
+                        objectMapper.readValue(operation, ActionInfo::class.java)
+                    } else null
+                }
+
+                if (actions.isNotEmpty()) {
+                    val message = SaveInfo(
+                        roomName = roomName,
+                        actions = actions,
+                        partialSave = true
+                    )
+                    logger.info("Scheduling auto-save for room: $roomName with ${actions.size} trimmed operations (removed: $removedCount)")
+                    backgroundService.addItemToProcess(message)
+                }
+            }
+
+            return updatedAction
         } catch (e: Exception) {
             logger.error("Error adding operations to cache", e)
+            throw e
         }
-
-        return updatedAction
     }
 
-    private fun updateRecordToCache(version: Int, action: ActionInfo) {
+    private fun updateRecordToCache(version: Int, action: ActionInfo): String {
         val serializedAction = objectMapper.writeValueAsString(action)
         val roomName = action.roomName
-        val revisionInfoKey = roomName + CollaborativeEditingHelper.REVISION_INFO_SUFFIX
-        val previousVersion = (version - 1).toString()
-        val saveThreshold = CollaborativeEditingHelper.SAVE_THRESHOLD.toString()
+
+        val opsKey = roomName + CollaborativeEditingHelper.OPS_SUFFIX
+        val startKey = roomName + CollaborativeEditingHelper.START_SUFFIX
 
         try {
-            val script = DefaultRedisScript<Void>()
-            script.setScriptText(CollaborativeEditingHelper.UPDATE_RECORD)
+            val script = DefaultRedisScript<String>()
+            script.setScriptText(CollaborativeEditingHelper.NEW_UPDATE_SCRIPT)
+            script.resultType = String::class.java
 
-            val keys = listOf(roomName, revisionInfoKey)
-            val args = listOf(serializedAction, previousVersion, saveThreshold)
+            val keys = listOf(opsKey, startKey)
+            val args = listOf(serializedAction, version.toString())
 
-            stringRedisTemplate.execute(script, keys, *args.toTypedArray())
+            return stringRedisTemplate.execute(script, keys, *args.toTypedArray()) ?: "ERROR"
         } catch (ex: Exception) {
             logger.error("Error updating record to cache", ex)
+            return "ERROR"
         }
-    }
-
-    private fun autoSaveChangesToSourceDocument(clearedOperations: List<Any>, action: ActionInfo) {
-        val actions = clearedOperations.mapNotNull { operation ->
-            if (operation is String) {
-                objectMapper.readValue(operation, ActionInfo::class.java)
-            } else null
-        }
-
-        // Prepare the message for saving the cleared operations
-        val message = SaveInfo(
-            roomName = action.roomName,
-            actions = actions,
-            partialSave = true
-        )
-        logger.info("Scheduling auto-save for room: ${action.roomName} with ${actions.size} cleared operations")
-        backgroundService.addItemToProcess(message)
     }
 
     private fun getDocumentFromMinIO(fileName: String): WordProcessorHelper {
