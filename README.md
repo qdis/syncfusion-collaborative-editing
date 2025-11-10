@@ -117,7 +117,7 @@ minio:
   region: us-east-1
 
 collaborative:
-  save-threshold: 150
+  save-threshold: 25
   redis-pub-sub-channel: collaborativeediting
 ```
 

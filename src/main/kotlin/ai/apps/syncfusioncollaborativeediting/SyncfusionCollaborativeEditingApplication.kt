@@ -5,11 +5,13 @@ package ai.apps.syncfusioncollaborativeediting
 import org.springframework.boot.autoconfigure.SpringBootApplication
 import org.springframework.boot.runApplication
 import org.springframework.scheduling.annotation.EnableScheduling
+import com.syncfusion.licensing.SyncfusionLicenseProvider
 
 @SpringBootApplication
 @EnableScheduling
 class SyncfusionCollaborativeEditingApplication
 
 fun main(args: Array<String>) {
+    SyncfusionLicenseProvider.registerLicense("GTIlMmhgYn1ifWJkaGBifGJhfGpqampzYWBpZmppZmpoJzo+PBM3NiUjPzI9J30hPGhgYg==")
     runApplication<SyncfusionCollaborativeEditingApplication>(*args)
 }

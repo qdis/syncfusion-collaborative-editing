@@ -6,7 +6,7 @@ object CollaborativeEditingHelper {
 
     // Maximum number of operations we can queue in single revision.
     // If we reach this limit, we will save the operations to source document.
-    const val SAVE_THRESHOLD = 150
+    const val SAVE_THRESHOLD = 25
 
     // Suffix key to store version information in redis cache.
     const val VERSION_INFO_SUFFIX = "_version_info"
@@ -19,9 +19,6 @@ object CollaborativeEditingHelper {
 
     // Suffix key to store removed actions information in redis cache.
     const val ACTIONS_TO_REMOVE_SUFFIX = "_actions_to_remove"
-
-    // Key to store room information with connection Id in redis cache.
-    const val CONNECTION_ID_ROOM_MAPPING_KEY = "ej_de_connection_id_room_mapping"
 
     // Lua script for inserting operations atomically with version management
     const val INSERT_SCRIPT = """

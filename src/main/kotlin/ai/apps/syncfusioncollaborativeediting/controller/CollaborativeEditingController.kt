@@ -33,20 +33,28 @@ class CollaborativeEditingController(
     @PostMapping("/api/collaborativeediting/ImportFile")
     fun importFile(@RequestBody file: FilesPathInfo): String {
         return try {
-            // Track the current document name for background saves
-            backgroundService.currentDocumentName = file.fileName
 
             val document = getDocumentFromMinIO(file.fileName)
 
             // Get the list of pending operations for the document
-            val actions = getPendingOperations(file.fileName, 0, -1)
+            val actions = getPendingOperations(file.roomName, 0, -1)
             if (!actions.isNullOrEmpty()) {
                 // If there are any pending actions, update the document with these actions
                 document.updateActions(actions)
             }
 
+            logger.info("Imported file: ${file.fileName} for room: ${file.roomName} with ${actions?.size ?: 0} pending actions")
+
+            // Get the current version directly from Redis
+            val versionKey = file.roomName + CollaborativeEditingHelper.VERSION_INFO_SUFFIX
+            val currentVersion = stringRedisTemplate.opsForValue().get(versionKey)?.toIntOrNull() ?: 0
+
             // Serialize the updated document to SFDT format
-            WordProcessorHelper.serialize(document)
+            val sfdtString = WordProcessorHelper.serialize(document)
+            val tree = objectMapper.readTree(sfdtString)
+            (tree as com.fasterxml.jackson.databind.node.ObjectNode).put("version", currentVersion)
+
+            return objectMapper.writeValueAsString(tree)
         } catch (e: Exception) {
             logger.error("Error importing file", e)
             """{"sections":[{"blocks":[{"inlines":[{"text":"${e.message}"}]}]}]}"""
@@ -55,6 +63,7 @@ class CollaborativeEditingController(
 
     @PostMapping("/api/collaborativeediting/UpdateAction")
     fun updateAction(@RequestBody param: ActionInfo): ActionInfo {
+        logger.info("Received UpdateAction request for room: ${param.roomName}, version: ${param.version}")
         val roomName = param.roomName
         val transformedAction = addOperationsToCache(param)
 
@@ -175,7 +184,7 @@ class CollaborativeEditingController(
 
             val response = stringRedisTemplate.execute(script, keys, *values.toTypedArray())
 
-            response?.let { results ->
+            response.let { results ->
                 // Parse the version number from the script results
                 val version = results[0].toString().toInt()
 
@@ -191,7 +200,7 @@ class CollaborativeEditingController(
                 }
 
                 // Increment the version for each previous operation
-                previousOperations.forEach { op -> op.version = op.version + 1 }
+                previousOperations.forEach { op -> op.version += 1 }
 
                 // Check if there are multiple previous operations to determine if transformation is needed
                 if (previousOperations.size > 1) {
@@ -260,6 +269,7 @@ class CollaborativeEditingController(
             actions = actions,
             partialSave = true
         )
+        logger.info("Scheduling auto-save for room: ${action.roomName} with ${actions.size} cleared operations")
         backgroundService.addItemToProcess(message)
     }
 

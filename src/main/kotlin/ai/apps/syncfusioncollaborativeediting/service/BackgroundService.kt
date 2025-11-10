@@ -5,7 +5,6 @@ package ai.apps.syncfusioncollaborativeediting.service
 import ai.apps.syncfusioncollaborativeediting.helper.CollaborativeEditingHelper
 import ai.apps.syncfusioncollaborativeediting.model.SaveInfo
 import com.syncfusion.docio.FormatType
-import com.syncfusion.docio.WordDocument
 import com.syncfusion.ej2.wordprocessor.CollaborativeEditingHandler
 import com.syncfusion.ej2.wordprocessor.WordProcessorHelper
 import org.slf4j.LoggerFactory
@@ -14,6 +13,8 @@ import org.springframework.scheduling.annotation.Scheduled
 import org.springframework.stereotype.Service
 import java.io.ByteArrayInputStream
 import java.io.ByteArrayOutputStream
+import java.nio.charset.StandardCharsets
+import java.util.Base64
 import java.util.concurrent.Semaphore
 
 @Service
@@ -26,9 +27,6 @@ class BackgroundService(
     private val itemsToProcess = mutableListOf<SaveInfo>()
     private val semaphore = Semaphore(1)
 
-    // Track current document being edited (simplified for demo)
-    @Volatile
-    var currentDocumentName: String? = null
 
     @Scheduled(fixedRate = 5000) // Runs every 5 seconds
     fun runBackgroundTask() {
@@ -73,8 +71,9 @@ class BackgroundService(
             }
 
             // Get the document name (in a real implementation, this should be tracked per room)
-            val fileName = currentDocumentName ?: workItem.roomName
+            val fileName = Base64.getDecoder().decode( workItem.roomName).toString(StandardCharsets.UTF_8)
 
+            logger.info("Applying ${actions.size} operations to document: $fileName in room: ${workItem.roomName}")
             // Load the document from MinIO
             val documentData = minioService.downloadDocument(fileName)
             val document = ByteArrayInputStream(documentData.readAllBytes()).use { stream ->
@@ -84,7 +83,11 @@ class BackgroundService(
             // Apply all actions to the document
             val handler = CollaborativeEditingHandler(document)
             actions.forEach { info ->
-                handler.updateAction(info)
+                try {
+                    handler.updateAction(info)
+                }catch (e: Exception){
+                    logger.error("Error applying action to document: $fileName", e)
+                }
             }
 
             // Save the updated document

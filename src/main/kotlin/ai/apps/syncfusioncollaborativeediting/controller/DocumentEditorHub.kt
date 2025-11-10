@@ -9,15 +9,22 @@ import org.slf4j.LoggerFactory
 import org.springframework.beans.factory.annotation.Value
 import org.springframework.context.event.EventListener
 import org.springframework.data.redis.core.StringRedisTemplate
+import org.springframework.messaging.Message
 import org.springframework.messaging.MessageHeaders
-import org.springframework.messaging.handler.annotation.DestinationVariable
+import org.springframework.messaging.handler.annotation.Header
 import org.springframework.messaging.handler.annotation.MessageMapping
 import org.springframework.messaging.simp.SimpMessageHeaderAccessor
 import org.springframework.messaging.simp.SimpMessagingTemplate
+import org.springframework.messaging.simp.annotation.SendToUser
+import org.springframework.messaging.simp.stomp.StompHeaderAccessor
 import org.springframework.messaging.support.MessageBuilder
+import org.springframework.messaging.support.MessageHeaderAccessor
 import org.springframework.stereotype.Controller
+import org.springframework.web.socket.messaging.SessionConnectEvent
+import org.springframework.web.socket.messaging.SessionConnectedEvent
 import org.springframework.web.socket.messaging.SessionDisconnectEvent
-import java.security.Principal
+import java.util.*
+
 
 @Controller
 class DocumentEditorHub(
@@ -31,53 +38,53 @@ class DocumentEditorHub(
     @Value("\${collaborative.redis-pub-sub-channel}")
     private lateinit var pubSubChannel: String
 
-    @MessageMapping("/join/{documentName}")
-    fun joinGroup(
-        info: ActionInfo,
-        headerAccessor: SimpMessageHeaderAccessor,
-        @DestinationVariable documentName: String,
-        principal: Principal
-    ) {
-        // Get the connection ID and authenticated username
-        val connectionId = headerAccessor.sessionId ?: return
-        val username = principal.name
 
-        info.connectionId = connectionId
-        info.currentUser = username
-        val docName = info.roomName
+    @MessageMapping("/init")
+    @SendToUser("/queue/init")
+    fun init(
+        @Header(SimpMessageHeaderAccessor.SESSION_ID_HEADER) sessionId: String,
+        @Header(name = "x-room-id", required = false) roomId: String?
+    ): Message<Map<String, String>> {
 
-        val additionalHeaders = mapOf("action" to "connectionId")
-        val headers = MessageHeaders(additionalHeaders)
+        logger.info("WebSocket connection initialized: $sessionId for room ID: $roomId")
+        if (roomId == null) {
+            // check room id
+            logger.info("WebSocket connection established without room ID.")
+            return MessageBuilder.createMessage(emptyMap(), MessageHeaders(mapOf()))
+        }
+        val documentName = String(Base64.getDecoder().decode(roomId))
+        stringRedisTemplate.opsForHash<String, String>().put("documentMap", sessionId, documentName)
+        notifyUserJoined(roomId)
 
-        // Send the connection ID to the client
-        broadcastToRoom(docName, info, headers)
+        return MessageBuilder.createMessage(mapOf("connectionId" to sessionId), MessageHeaders(mapOf("action" to "connectionId")))
 
-        // Maintain the session ID with its corresponding document name
-        stringRedisTemplate.opsForHash<String, String>().put("documentMap", connectionId, documentName)
-
-        // Add the user details to the Redis cache
-        val openedDocName = docName + CollaborativeEditingHelper.USER_INFO_SUFFIX
-        stringRedisTemplate.opsForList().rightPush(openedDocName, objectMapper.writeValueAsString(info))
-
-        // Broadcast user joined event
-        notifyUserJoined(openedDocName)
     }
+
+
+    @EventListener
+    fun handleConnectEvent(event: SessionConnectedEvent) {
+
+        logger.info("WebSocket connection established: ${event.message.headers[SimpMessageHeaderAccessor.SESSION_ID_HEADER]}")
+    }
+
 
     @EventListener
     fun handleWebSocketDisconnectListener(event: SessionDisconnectEvent) {
-        val sessionId = event.sessionId ?: return
+        val sessionId = event.sessionId
+
+        logger.info("WebSocket connection closed: $sessionId")
 
         // Get the document name for the session
         val docName = stringRedisTemplate.opsForHash<String, String>().get("documentMap", sessionId)
         if (docName != null) {
             val openedDocName = docName + CollaborativeEditingHelper.USER_INFO_SUFFIX
-            notifyUserLeft(openedDocName, sessionId)
+            notifyUserLeft(docName, openedDocName, sessionId)
         }
     }
 
-    private fun notifyUserJoined(docName: String) {
+    private fun notifyUserJoined(roomId: String) {
         // Get the list of users from Redis
-        val userJsonStrings = stringRedisTemplate.opsForList().range(docName, 0, -1) ?: emptyList()
+        val userJsonStrings = stringRedisTemplate.opsForList().range(roomId, 0, -1) ?: emptyList()
         val actionsList = userJsonStrings.mapNotNull { userJson ->
             try {
                 objectMapper.readValue(userJson, ActionInfo::class.java)
@@ -88,10 +95,11 @@ class DocumentEditorHub(
         }
 
         val addUserHeaders = MessageHeaders(mapOf("action" to "addUser"))
-        broadcastToRoom(docName, actionsList, addUserHeaders)
+        logger.info("Broadcasting user joined to room: $roomId with users: ${actionsList.map { it.currentUser }}")
+        broadcastToRoom(roomId, actionsList, addUserHeaders)
     }
 
-    private fun notifyUserLeft(docName: String, sessionId: String) {
+    private fun notifyUserLeft(roomName: String, docName: String, sessionId: String) {
         // Get the user list from Redis
         val userJsonStrings = stringRedisTemplate.opsForList().range(docName, 0, -1) ?: emptyList()
 
@@ -104,7 +112,7 @@ class DocumentEditorHub(
                         stringRedisTemplate.opsForList().remove(docName, 1, userJson)
 
                         val removeUserHeaders = MessageHeaders(mapOf("action" to "removeUser"))
-                        broadcastToRoom(docName, action, removeUserHeaders)
+                        broadcastToRoom(roomName, action, removeUserHeaders)
 
                         // Remove the session ID from the session-document mapping
                         stringRedisTemplate.opsForHash<String, String>().delete("documentMap", sessionId)

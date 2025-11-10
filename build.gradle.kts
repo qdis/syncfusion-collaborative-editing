@@ -27,6 +27,7 @@ dependencies {
     implementation("com.syncfusion:syncfusion-ej2-wordprocessor:+")
     implementation("com.syncfusion:syncfusion-ej2-spellchecker:+")
     implementation("com.syncfusion:syncfusion-docio:+")
+    implementation("com.syncfusion:syncfusion-licensing:+")
     implementation("com.syncfusion:syncfusion-javahelper:+")
     developmentOnly("org.springframework.boot:spring-boot-docker-compose")
     implementation("org.springframework.boot:spring-boot-starter-data-redis")
