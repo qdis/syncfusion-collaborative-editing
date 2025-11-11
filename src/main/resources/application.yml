@@ -23,6 +23,6 @@ minio:
   region: us-east-1
 
 # Collaborative Editing Configuration
+# Note: Document saves are now UI-initiated via /api/collaborativeediting/SaveDocument
 collaborative:
-  save-threshold: 150
-  autosave-interval-ms: 3000
+  room-cleanup-interval-ms: 30000  # Interval for cleaning up inactive room keys

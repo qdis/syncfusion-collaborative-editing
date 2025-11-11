@@ -5,10 +5,10 @@ package ai.apps.syncfusioncollaborativeediting.model
 import java.time.Instant
 
 data class UserSessionInfo(
-    val userName: String,
+    val userName: String? = null,
     val userId: String,
     val sessionId: String,
-    val lastHeartbeat: Instant,
+    val lastHeartbeat: Instant? = null,
     val lastAction: Instant? = null,
     val lastSave: Instant? = null
 )

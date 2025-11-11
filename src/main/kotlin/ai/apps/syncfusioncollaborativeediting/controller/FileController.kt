@@ -2,6 +2,9 @@
 // ABOUTME: Provides endpoints for listing, uploading, and downloading files from MinIO
 package ai.apps.syncfusioncollaborativeediting.controller
 
+import ai.apps.syncfusioncollaborativeediting.model.ApiResponse
+import ai.apps.syncfusioncollaborativeediting.model.FileUploadResponse
+import ai.apps.syncfusioncollaborativeediting.model.UserInfoResponse
 import ai.apps.syncfusioncollaborativeediting.service.MinioService
 import org.springframework.core.io.InputStreamResource
 import org.springframework.http.HttpHeaders
@@ -18,8 +21,8 @@ class FileController(
 ) {
 
     @GetMapping("/currentUser")
-    fun getCurrentUser(principal: Principal): Map<String, String> {
-        return mapOf("username" to principal.name)
+    fun getCurrentUser(principal: Principal): UserInfoResponse {
+        return UserInfoResponse(username = principal.name)
     }
 
     @GetMapping
@@ -28,16 +31,16 @@ class FileController(
     }
 
     @PostMapping("/upload")
-    fun uploadFile(@RequestParam("file") file: MultipartFile): ResponseEntity<Map<String, String>> {
+    fun uploadFile(@RequestParam("file") file: MultipartFile): ResponseEntity<*> {
         val fileName = file.originalFilename ?: return ResponseEntity.badRequest()
-            .body(mapOf("error" to "File name is required"))
+            .body(ApiResponse<Unit>(error = "File name is required"))
 
         minioService.uploadDocument(fileName, file.inputStream, file.size)
 
         return ResponseEntity.ok(
-            mapOf(
-                "message" to "File uploaded successfully",
-                "fileName" to fileName
+            FileUploadResponse(
+                message = "File uploaded successfully",
+                fileName = fileName
             )
         )
     }

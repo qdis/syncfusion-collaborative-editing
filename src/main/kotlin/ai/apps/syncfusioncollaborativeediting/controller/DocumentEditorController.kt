@@ -2,6 +2,7 @@
 // ABOUTME: Handles standard operations like import, spell check, and system clipboard
 package ai.apps.syncfusioncollaborativeediting.controller
 
+import ai.apps.syncfusioncollaborativeediting.model.SpellCheckResponse
 import com.syncfusion.ej2.wordprocessor.FormatType
 import com.syncfusion.ej2.wordprocessor.WordProcessorHelper
 import org.slf4j.LoggerFactory
@@ -53,21 +54,21 @@ class DocumentEditorController {
     }
 
     @PostMapping("/SpellCheck")
-    fun spellCheck(@RequestBody content: Map<String, Any>): Map<String, Any> {
+    fun spellCheck(@RequestBody content: Map<String, Any>): SpellCheckResponse {
         // Basic spell check response - returns empty suggestions
         // In production, integrate with a spell check library
-        return mapOf(
-            "HasSpellingError" to false,
-            "Suggestions" to emptyList<String>()
+        return SpellCheckResponse(
+            HasSpellingError = false,
+            Suggestions = emptyList()
         )
     }
 
     @PostMapping("/SpellCheckByPage")
-    fun spellCheckByPage(@RequestBody content: Map<String, Any>): Map<String, Any> {
+    fun spellCheckByPage(@RequestBody content: Map<String, Any>): SpellCheckResponse {
         // Basic spell check response - returns empty suggestions
-        return mapOf(
-            "HasSpellingError" to false,
-            "Suggestions" to emptyList<String>()
+        return SpellCheckResponse(
+            HasSpellingError = false,
+            Suggestions = emptyList()
         )
     }
 
