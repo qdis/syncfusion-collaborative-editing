@@ -3,8 +3,8 @@
 package ai.apps.syncfusioncollaborativeediting.controller
 
 import ai.apps.syncfusioncollaborativeediting.helper.CollaborativeEditingHelper
+import ai.apps.syncfusioncollaborativeediting.model.UserSessionInfo
 import com.fasterxml.jackson.databind.ObjectMapper
-import com.syncfusion.ej2.wordprocessor.ActionInfo
 import org.slf4j.LoggerFactory
 import org.springframework.beans.factory.annotation.Value
 import org.springframework.context.event.EventListener
@@ -21,6 +21,7 @@ import org.springframework.stereotype.Controller
 import org.springframework.web.socket.messaging.SessionConnectedEvent
 import org.springframework.web.socket.messaging.SessionDisconnectEvent
 import java.security.Principal
+import java.time.Instant
 import java.util.*
 
 
@@ -47,18 +48,22 @@ class DocumentEditorHub(
             logger.info("WebSocket connection established without room ID.")
             return MessageBuilder.createMessage(emptyMap(), MessageHeaders(mapOf()))
         }
-        val documentName = String(Base64.getDecoder().decode(roomId))
-        stringRedisTemplate.opsForHash<String, String>().put("documentMap", sessionId, documentName)
 
-        // Add user to presence list
+        // Store session-to-room mapping using roomId directly
+        stringRedisTemplate.opsForHash<String, String>().put("sessionIdToRoomIdMapping", sessionId, roomId)
+
+        // Add user to presence list with timestamps
         val userInfoKey = roomId + CollaborativeEditingHelper.USER_INFO_SUFFIX
         val currentUser = principal.map { it.name }.orElse("Anonymous")
-        val userAction = ActionInfo().apply {
-            connectionId = sessionId
-            this.currentUser = currentUser
-            this.roomName = roomId
-        }
-        val userJson = objectMapper.writeValueAsString(userAction)
+        val userSession = UserSessionInfo(
+            userName = currentUser,
+            userId = currentUser,
+            sessionId = sessionId,
+            lastHeartbeat = Instant.now(),
+            lastAction = null,
+            lastSave = null
+        )
+        val userJson = objectMapper.writeValueAsString(userSession)
         stringRedisTemplate.opsForList().rightPush(userInfoKey, userJson)
 
         // Track active room
@@ -71,7 +76,7 @@ class DocumentEditorHub(
         return MessageBuilder.createMessage(
             mapOf(
                 "connectionId" to sessionId,
-                "users" to currentUsers.map { objectMapper.readValue(it, ActionInfo::class.java) }
+                "users" to currentUsers.map { objectMapper.readValue(it, UserSessionInfo::class.java) }
             ),
             MessageHeaders(mapOf("action" to "connectionId"))
         )
@@ -92,10 +97,9 @@ class DocumentEditorHub(
 
         logger.info("WebSocket connection closed: $sessionId")
 
-        // Get the document name for the session
-        val documentName = stringRedisTemplate.opsForHash<String, String>().get("documentMap", sessionId)
-        if (documentName != null) {
-            val roomId = Base64.getEncoder().encodeToString(documentName.toByteArray())
+        // Get the roomId for the session
+        val roomId = stringRedisTemplate.opsForHash<String, String>().get("sessionIdToRoomIdMapping", sessionId)
+        if (roomId != null) {
             notifyUserLeft(roomId, sessionId)
         }
     }
@@ -104,9 +108,9 @@ class DocumentEditorHub(
         // Get the list of users from Redis using consistent key pattern
         val userInfoKey = roomId + CollaborativeEditingHelper.USER_INFO_SUFFIX
         val userJsonStrings = stringRedisTemplate.opsForList().range(userInfoKey, 0, -1) ?: emptyList()
-        val actionsList = userJsonStrings.mapNotNull { userJson ->
+        val usersList = userJsonStrings.mapNotNull { userJson ->
             try {
-                objectMapper.readValue(userJson, ActionInfo::class.java)
+                objectMapper.readValue(userJson, UserSessionInfo::class.java)
             } catch (e: Exception) {
                 logger.error("Error parsing user information JSON", e)
                 null
@@ -114,8 +118,8 @@ class DocumentEditorHub(
         }
 
         val addUserHeaders = MessageHeaders(mapOf("action" to "addUser"))
-        logger.info("Broadcasting user joined to room: $roomId with users: ${actionsList.map { it.currentUser }}")
-        broadcastToRoom(roomId, actionsList, addUserHeaders)
+        logger.info("Broadcasting user joined to room: $roomId with users: ${usersList.map { it.userName }}")
+        broadcastToRoom(roomId, usersList, addUserHeaders)
     }
 
     private fun notifyUserLeft(roomId: String, sessionId: String) {
@@ -125,22 +129,22 @@ class DocumentEditorHub(
         if (userJsonStrings.isNotEmpty()) {
             for (userJson in userJsonStrings) {
                 try {
-                    val action = objectMapper.readValue(userJson, ActionInfo::class.java)
-                    if (action.connectionId == sessionId) {
+                    val userSession = objectMapper.readValue(userJson, UserSessionInfo::class.java)
+                    if (userSession.sessionId == sessionId) {
                         // Remove the user from the user list
                         stringRedisTemplate.opsForList().remove(userInfoKey, 1, userJson)
 
                         // Fetch remaining users and broadcast full list
                         val remainingUserJsons = stringRedisTemplate.opsForList().range(userInfoKey, 0, -1) ?: emptyList()
-                        val actionsList = remainingUserJsons.map { json ->
-                            objectMapper.readValue(json, ActionInfo::class.java)
+                        val usersList = remainingUserJsons.map { json ->
+                            objectMapper.readValue(json, UserSessionInfo::class.java)
                         }
 
                         val removeUserHeaders = MessageHeaders(mapOf("action" to "removeUser"))
-                        broadcastToRoom(roomId, actionsList, removeUserHeaders)
+                        broadcastToRoom(roomId, usersList, removeUserHeaders)
 
-                        // Remove the session ID from the session-document mapping
-                        stringRedisTemplate.opsForHash<String, String>().delete("documentMap", sessionId)
+                        // Remove the session ID from the session-room mapping
+                        stringRedisTemplate.opsForHash<String, String>().delete("sessionIdToRoomIdMapping", sessionId)
                         break
                     }
                 } catch (e: Exception) {
@@ -154,6 +158,42 @@ class DocumentEditorHub(
                 stringRedisTemplate.delete(userInfoKey)
                 stringRedisTemplate.opsForSet().remove("active_rooms", roomId)
                 logger.debug("Room $roomId is now inactive (no users)")
+            }
+        }
+    }
+
+    fun updateUserTimestamps(
+        roomId: String,
+        userName: String,
+        updateLastHeartbeat: Boolean = false,
+        updateLastAction: Boolean = false,
+        updateLastSave: Boolean = false
+    ) {
+        val userInfoKey = roomId + CollaborativeEditingHelper.USER_INFO_SUFFIX
+        val userJsonStrings = stringRedisTemplate.opsForList().range(userInfoKey, 0, -1) ?: emptyList()
+
+        for (userJson in userJsonStrings) {
+            try {
+                val userSession = objectMapper.readValue(userJson, UserSessionInfo::class.java)
+                if (userSession.userName == userName) {
+                    val now = Instant.now()
+                    val updatedSession = userSession.copy(
+                        lastHeartbeat = if (updateLastHeartbeat) now else userSession.lastHeartbeat,
+                        lastAction = if (updateLastAction) now else userSession.lastAction,
+                        lastSave = if (updateLastSave) now else userSession.lastSave
+                    )
+
+                    val updatedJson = objectMapper.writeValueAsString(updatedSession)
+
+                    // Remove old entry and add updated entry
+                    stringRedisTemplate.opsForList().remove(userInfoKey, 1, userJson)
+                    stringRedisTemplate.opsForList().rightPush(userInfoKey, updatedJson)
+
+                    logger.debug("Updated timestamps for user $userName in room $roomId")
+                    break
+                }
+            } catch (e: Exception) {
+                logger.error("Error updating user timestamps", e)
             }
         }
     }

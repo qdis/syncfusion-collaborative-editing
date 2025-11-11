@@ -4,8 +4,11 @@ package ai.apps.syncfusioncollaborativeediting.controller
 
 import ai.apps.syncfusioncollaborativeediting.helper.CollaborativeEditingHelper
 import ai.apps.syncfusioncollaborativeediting.model.FilesPathInfo
+import ai.apps.syncfusioncollaborativeediting.model.ShouldSaveRequest
+import ai.apps.syncfusioncollaborativeediting.model.UpdateDocumentRequest
 import ai.apps.syncfusioncollaborativeediting.service.MinioService
 import com.fasterxml.jackson.databind.ObjectMapper
+import com.syncfusion.docio.FormatType
 import com.syncfusion.ej2.wordprocessor.ActionInfo
 import com.syncfusion.ej2.wordprocessor.CollaborativeEditingHandler
 import com.syncfusion.ej2.wordprocessor.WordProcessorHelper
@@ -20,6 +23,7 @@ import org.springframework.web.bind.annotation.RequestBody
 import org.springframework.web.bind.annotation.RestController
 import org.springframework.web.server.ResponseStatusException
 import java.io.ByteArrayInputStream
+import java.io.ByteArrayOutputStream
 
 @RestController
 @CrossOrigin(origins = ["*"], allowedHeaders = ["*"])
@@ -88,12 +92,24 @@ class CollaborativeEditingController(
 
 
     @PostMapping("/api/collaborativeediting/UpdateAction")
-    fun updateAction(@RequestBody param: ActionInfo): ActionInfo {
+    fun updateAction(
+        @RequestBody param: ActionInfo,
+        @org.springframework.web.bind.annotation.RequestHeader("x-room-id") roomId: String,
+        principal: java.security.Principal
+    ): ActionInfo {
         logger.info("Received UpdateAction request for room: ${param.roomName}, version: ${param.version}")
         val roomName = param.roomName
 
         return try {
             val transformedAction = addOperationsToCache(param)
+
+            // Update user timestamps
+            documentEditorHub.updateUserTimestamps(
+                roomId = roomId,
+                userName = principal.name,
+                updateLastHeartbeat = true,
+                updateLastAction = true
+            )
 
             // Mark room as dirty for background autosave
             stringRedisTemplate.opsForSet().add("dirty_rooms", roomName)
@@ -148,6 +164,94 @@ class CollaborativeEditingController(
         } catch (ex: Exception) {
             logger.error("Error getting actions from server", ex)
             """{"operations":[],"resync":false}"""
+        }
+    }
+
+    @PostMapping("/api/collaborativeediting/ShouldSave")
+    fun shouldSave(@RequestBody request: ShouldSaveRequest): String {
+        return try {
+            val roomName = request.roomName
+            val version = request.latestAppliedVersion
+
+            val persistedKey = roomName + CollaborativeEditingHelper.PERSISTED_VERSION_SUFFIX
+            val currentPersistedVersion = stringRedisTemplate.opsForValue().get(persistedKey)?.toIntOrNull() ?: 0
+
+            val shouldSave = version > currentPersistedVersion
+
+            logger.debug("ShouldSave check: room=$roomName, version=$version, persisted=$currentPersistedVersion, shouldSave=$shouldSave")
+
+            """{"shouldSave":$shouldSave,"currentPersistedVersion":$currentPersistedVersion}"""
+        } catch (ex: Exception) {
+            logger.error("Error checking if should save", ex)
+            """{"shouldSave":false,"error":"${ex.message}"}"""
+        }
+    }
+
+    @PostMapping("/api/collaborativeediting/SaveDocument")
+    fun saveDocument(
+        @RequestBody request: UpdateDocumentRequest,
+        @org.springframework.web.bind.annotation.RequestHeader("x-room-id") roomId: String,
+        principal: java.security.Principal
+    ): String {
+        return try {
+            val roomName = request.roomName
+            val sfdt = request.sfdt
+            val version = request.latestAppliedVersion
+
+            logger.info("Saving document for room: $roomName at version: $version")
+
+            // Check if a newer version is already saved
+            val persistedKey = roomName + CollaborativeEditingHelper.PERSISTED_VERSION_SUFFIX
+            val currentPersistedVersion = stringRedisTemplate.opsForValue().get(persistedKey)?.toIntOrNull() ?: 0
+
+            if (version <= currentPersistedVersion) {
+                logger.info("Skipping save: version $version < persisted version $currentPersistedVersion for room: $roomName")
+                return """{"success":true,"message":"No save needed - newer version already persisted","skipped":true}"""
+            }
+
+            // Decode roomName to get fileName (roomName is base64-encoded fileName)
+            val fileName = String(java.util.Base64.getDecoder().decode(roomName))
+
+            // Convert SFDT to DOCX
+            val doc = WordProcessorHelper.save(sfdt)
+            val outputStream = ByteArrayOutputStream()
+            doc.save(outputStream, FormatType.Docx)
+            val docxBytes = outputStream.toByteArray()
+
+            // Upload to MinIO
+            minioService.uploadDocument(fileName, docxBytes)
+            logger.info("Uploaded document to MinIO: $fileName")
+
+            // Update user's lastSave timestamp
+            documentEditorHub.updateUserTimestamps(
+                roomId = roomId,
+                userName = principal.name,
+                updateLastSave = true
+            )
+
+            // Cleanup Redis operations (delete ops with version < saved version)
+            val opsHashKey = roomName + CollaborativeEditingHelper.OPS_HASH_SUFFIX
+            val opsIndexKey = roomName + CollaborativeEditingHelper.OPS_INDEX_SUFFIX
+
+            val cleanupScript = DefaultRedisScript<String>()
+            cleanupScript.setScriptText(CollaborativeEditingHelper.UI_SAVE_CLEANUP_SCRIPT)
+            cleanupScript.resultType = String::class.java
+
+            stringRedisTemplate.execute(
+                cleanupScript,
+                listOf(opsHashKey, opsIndexKey, persistedKey),
+                version.toString()
+            )
+
+            logger.info("Cleaned up operations < version $version for room: $roomName")
+
+            """{"success":true,"message":"Document saved successfully"}"""
+        } catch (ex: Exception) {
+            logger.error("Error saving document", ex)
+            throw ResponseStatusException(
+                HttpStatus.INTERNAL_SERVER_ERROR,
+                "Failed to save document: ${ex.message}"
+            )
         }
     }
 
