@@ -31,7 +31,7 @@ class CollaborativeEditingController(
     @PostMapping("/api/collaborativeediting/ImportFile")
     fun importFile(@RequestBody file: FilesPathInfo): Any {
         return try {
-            collaborativeEditingService.importDocument(file.fileName, file.roomName)
+            collaborativeEditingService.importDocument(file.fileId)
         } catch (e: Exception) {
             logger.error("Error importing file", e)
             objectMapper.writeValueAsString(
@@ -45,17 +45,18 @@ class CollaborativeEditingController(
         @RequestBody param: ActionInfo,
         principal: Principal
     ): ActionInfo {
-        logger.info("Received UpdateAction request for room: ${param.roomName}, version: ${param.version}")
+        val fileId = java.util.UUID.fromString(param.roomName)
+        logger.info("Received UpdateAction request for file: $fileId, version: ${param.version}")
 
         val result = try {
-            collaborativeEditingService.appendOperation(param, param.roomName)
+            collaborativeEditingService.appendOperation(param, fileId)
         } catch (e: StaleClientException) {
             throw ResponseStatusException(HttpStatus.CONFLICT, e.message)
         }
 
         // Update user timestamps
         collaborativeEditingService.updateUserTimestamps(
-            roomId = param.roomName,
+            fileId = fileId,
             userName = principal.name,
             updateLastHeartbeat = true,
             updateLastAction = true
@@ -63,7 +64,7 @@ class CollaborativeEditingController(
 
         // Broadcast operation
         documentEditorHub.broadcastToRoom(
-            param.roomName,
+            fileId,
             result,
             MessageHeaders(mapOf("action" to "updateAction"))
         )
@@ -74,7 +75,8 @@ class CollaborativeEditingController(
     @PostMapping("/api/collaborativeediting/GetActionsFromServer")
     fun getActionsFromServer(@RequestBody param: ActionInfo): String {
         return try {
-            val result = collaborativeEditingService.getOperationsSince(param.roomName, param.version)
+            val fileId = java.util.UUID.fromString(param.roomName)
+            val result = collaborativeEditingService.getOperationsSince(fileId, param.version)
 
             val response = OperationsSyncResponse(
                 operations = result.operations,
@@ -97,11 +99,11 @@ class CollaborativeEditingController(
         principal: Principal
     ): String {
         return try {
-            val result = collaborativeEditingService.shouldSave(request.roomName, request.latestAppliedVersion)
+            val result = collaborativeEditingService.shouldSave(request.fileId, request.latestAppliedVersion)
 
             // Update user heartbeat
             collaborativeEditingService.updateUserTimestamps(
-                roomId = request.roomName,
+                fileId = request.fileId,
                 userName = principal.name,
                 updateLastHeartbeat = true
             )
@@ -127,14 +129,14 @@ class CollaborativeEditingController(
     ): String {
         return try {
             val result = collaborativeEditingService.saveDocument(
-                request.roomName,
+                request.fileId,
                 request.sfdt,
                 request.latestAppliedVersion
             )
 
             // Update user's lastSave and lastHeartbeat timestamps
             collaborativeEditingService.updateUserTimestamps(
-                roomId = request.roomName,
+                fileId = request.fileId,
                 userName = principal.name,
                 updateLastHeartbeat = true,
                 updateLastSave = true

@@ -1,7 +1,9 @@
 // ABOUTME: Initialization service that runs on application startup
-// ABOUTME: Creates MinIO bucket and seeds a sample document for testing
+// ABOUTME: Creates MinIO bucket, database records, and seeds a sample document for testing
 package ai.apps.syncfusioncollaborativeediting.service
 
+import ai.apps.syncfusioncollaborativeediting.entity.File
+import ai.apps.syncfusioncollaborativeediting.repository.FileRepository
 import com.syncfusion.docio.FormatType
 import com.syncfusion.docio.WordDocument
 import org.slf4j.LoggerFactory
@@ -12,7 +14,8 @@ import java.io.ByteArrayOutputStream
 
 @Service
 class DataInitializationService(
-    private val minioService: MinioService
+    private val minioService: MinioService,
+    private val fileRepository: FileRepository
 ) : ApplicationRunner {
 
     private val logger = LoggerFactory.getLogger(DataInitializationService::class.java)
@@ -27,10 +30,17 @@ class DataInitializationService(
             logger.info("MinIO bucket verified/created successfully")
 
             // Create and upload sample document if it doesn't exist
-            if (!minioService.documentExists(defaultDocumentName)) {
+            val fileExists = minioService.documentExists(defaultDocumentName)
+            val dbRecordExists = fileRepository.existsByFileName(defaultDocumentName)
+
+            if (!fileExists && !dbRecordExists) {
                 logger.info("Sample document not found. Creating and uploading...")
                 createAndUploadSampleDocument()
                 logger.info("Sample document created and uploaded successfully")
+            } else if (fileExists && !dbRecordExists) {
+                // MinIO file exists but no DB record - create DB record
+                val fileRecord = fileRepository.save(File(fileName = defaultDocumentName))
+                logger.info("Created database record for existing sample document with ID: ${fileRecord.id}")
             } else {
                 logger.info("Sample document already exists: $defaultDocumentName")
             }
@@ -118,6 +128,10 @@ class DataInitializationService(
 
             // Upload to MinIO
             minioService.uploadDocument(defaultDocumentName, documentBytes)
+
+            // Create database record
+            val fileRecord = fileRepository.save(File(fileName = defaultDocumentName))
+            logger.info("Created database record for sample document with ID: ${fileRecord.id}")
 
             outputStream.close()
         } finally {

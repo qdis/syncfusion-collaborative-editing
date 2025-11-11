@@ -5,7 +5,7 @@ package ai.apps.syncfusioncollaborativeediting.service
 import ai.apps.syncfusioncollaborativeediting.constant.RedisKeys
 import ai.apps.syncfusioncollaborativeediting.constant.ResponseFields
 import ai.apps.syncfusioncollaborativeediting.model.UserSessionInfo
-import ai.apps.syncfusioncollaborativeediting.util.Base64Utils
+import ai.apps.syncfusioncollaborativeediting.repository.FileRepository
 import ai.apps.syncfusioncollaborativeediting.util.RedisKeyBuilder
 import com.fasterxml.jackson.databind.ObjectMapper
 import com.syncfusion.docio.FormatType
@@ -17,13 +17,15 @@ import org.springframework.stereotype.Service
 import java.io.ByteArrayInputStream
 import java.io.ByteArrayOutputStream
 import java.time.Instant
+import java.util.UUID
 
 @Service
 class CollaborativeEditingService(
     private val minioService: MinioService,
     private val stringRedisTemplate: StringRedisTemplate,
     private val objectMapper: ObjectMapper,
-    private val scriptExecutor: RedisScriptExecutor
+    private val scriptExecutor: RedisScriptExecutor,
+    private val fileRepository: FileRepository
 ) {
 
     private val logger = LoggerFactory.getLogger(CollaborativeEditingService::class.java)
@@ -32,17 +34,21 @@ class CollaborativeEditingService(
      * Import document from MinIO and apply pending operations.
      * Returns SFDT string with version stamped.
      */
-    fun importDocument(fileName: String, roomName: String): String {
+    fun importDocument(fileId: UUID): String {
+        val file = fileRepository.findById(fileId).orElseThrow {
+            IllegalArgumentException("File not found: $fileId")
+        }
+        val fileName = file.fileName
         val document = getDocumentFromMinIO(fileName)
 
         // Apply pending operations newer than persisted MinIO state
-        val actions = getPendingOperations(roomName)
+        val actions = getPendingOperations(fileId)
         if (actions.isNotEmpty()) {
             document.updateActions(actions)
         }
-        logger.info("Imported file: $fileName for room: $roomName with ${actions.size} pending actions")
+        logger.info("Imported file: $fileName (id=$fileId) with ${actions.size} pending actions")
 
-        val keys = RedisKeyBuilder(roomName)
+        val keys = RedisKeyBuilder(fileId)
 
         // Initialize version counters for new documents atomically
         scriptExecutor.initVersionCounters(keys)
@@ -62,7 +68,7 @@ class CollaborativeEditingService(
         val tree = objectMapper.readTree(sfdtString)
         (tree as com.fasterxml.jackson.databind.node.ObjectNode).put(ResponseFields.VERSION, stampVersion)
 
-        logger.info("Document for room: $roomName stamped with version: $stampVersion")
+        logger.info("Document for file: $fileId stamped with version: $stampVersion")
 
         return objectMapper.writeValueAsString(tree)
     }
@@ -71,10 +77,10 @@ class CollaborativeEditingService(
      * Append operation to Redis and return operation with assigned version.
      * Throws exception if client is stale (version < persisted).
      */
-    fun appendOperation(action: ActionInfo, roomName: String): ActionInfo {
-        logger.info("Appending operation for room: $roomName, client version: ${action.version}")
+    fun appendOperation(action: ActionInfo, fileId: UUID): ActionInfo {
+        logger.info("Appending operation for file: $fileId, client version: ${action.version}")
 
-        val keys = RedisKeyBuilder(roomName)
+        val keys = RedisKeyBuilder(fileId)
 
         // Ensure version counter is at least persisted_version
         scriptExecutor.ensureVersionMin(keys)
@@ -99,8 +105,8 @@ class CollaborativeEditingService(
      * Get operations since client version for sync.
      * Returns operations data, resync flag, and window start.
      */
-    fun getOperationsSince(roomName: String, clientVersion: Int): GetOperationsResult {
-        val keys = RedisKeyBuilder(roomName)
+    fun getOperationsSince(fileId: UUID, clientVersion: Int): GetOperationsResult {
+        val keys = RedisKeyBuilder(fileId)
 
         val scriptResult = scriptExecutor.getOperationsSince(keys, clientVersion)
 
@@ -118,12 +124,12 @@ class CollaborativeEditingService(
     /**
      * Check if document should be saved based on version comparison.
      */
-    fun shouldSave(roomName: String, latestAppliedVersion: Int): ShouldSaveResult {
-        val keys = RedisKeyBuilder(roomName)
+    fun shouldSave(fileId: UUID, latestAppliedVersion: Int): ShouldSaveResult {
+        val keys = RedisKeyBuilder(fileId)
         val currentPersistedVersion = stringRedisTemplate.opsForValue().get(keys.persistedVersionKey())?.toIntOrNull() ?: 0
         val shouldSave = latestAppliedVersion > currentPersistedVersion
 
-        logger.debug("ShouldSave check: room=$roomName, version=$latestAppliedVersion, persisted=$currentPersistedVersion, shouldSave=$shouldSave")
+        logger.debug("ShouldSave check: file=$fileId, version=$latestAppliedVersion, persisted=$currentPersistedVersion, shouldSave=$shouldSave")
 
         return ShouldSaveResult(shouldSave, currentPersistedVersion)
     }
@@ -132,15 +138,15 @@ class CollaborativeEditingService(
      * Save document to MinIO and cleanup old operations.
      * Returns success result or throws exception on failure.
      */
-    fun saveDocument(roomName: String, sfdt: String, latestAppliedVersion: Int): SaveDocumentResult {
-        logger.info("Saving document for room: $roomName at version: $latestAppliedVersion")
+    fun saveDocument(fileId: UUID, sfdt: String, latestAppliedVersion: Int): SaveDocumentResult {
+        logger.info("Saving document for file: $fileId at version: $latestAppliedVersion")
 
-        val keys = RedisKeyBuilder(roomName)
+        val keys = RedisKeyBuilder(fileId)
 
         // Check if newer version is already saved
         val currentPersistedVersion = stringRedisTemplate.opsForValue().get(keys.persistedVersionKey())?.toIntOrNull() ?: 0
         if (latestAppliedVersion <= currentPersistedVersion) {
-            logger.info("Skipping save: version $latestAppliedVersion <= persisted version $currentPersistedVersion for room: $roomName")
+            logger.info("Skipping save: version $latestAppliedVersion <= persisted version $currentPersistedVersion for file: $fileId")
             return SaveDocumentResult(
                 success = true,
                 message = ResponseFields.SAVE_NOT_NEEDED,
@@ -148,8 +154,11 @@ class CollaborativeEditingService(
             )
         }
 
-        // Decode roomName to get fileName
-        val fileName = Base64Utils.decodeRoomNameToFileName(roomName)
+        // Lookup fileName from database
+        val file = fileRepository.findById(fileId).orElseThrow {
+            IllegalArgumentException("File not found: $fileId")
+        }
+        val fileName = file.fileName
 
         // Convert SFDT to DOCX
         val doc = WordProcessorHelper.save(sfdt)
@@ -164,7 +173,7 @@ class CollaborativeEditingService(
         // Cleanup Redis operations
         scriptExecutor.cleanupAfterSave(keys, latestAppliedVersion)
 
-        logger.info("Cleaned up operations < version $latestAppliedVersion for room: $roomName")
+        logger.info("Cleaned up operations < version $latestAppliedVersion for file: $fileId")
 
         return SaveDocumentResult(
             success = true,
@@ -174,11 +183,11 @@ class CollaborativeEditingService(
     }
 
     /**
-     * Get pending operations for a room (operations after persisted version).
+     * Get pending operations for a file (operations after persisted version).
      */
-    fun getPendingOperations(roomName: String): List<ActionInfo> {
+    fun getPendingOperations(fileId: UUID): List<ActionInfo> {
         return try {
-            val keys = RedisKeyBuilder(roomName)
+            val keys = RedisKeyBuilder(fileId)
             val persistedVersion = stringRedisTemplate.opsForValue().get(keys.persistedVersionKey())?.toIntOrNull() ?: 0
 
             val versions = stringRedisTemplate.opsForZSet()
@@ -209,13 +218,13 @@ class CollaborativeEditingService(
      * Update user session timestamps in Redis.
      */
     fun updateUserTimestamps(
-        roomId: String,
+        fileId: UUID,
         userName: String,
         updateLastHeartbeat: Boolean = false,
         updateLastAction: Boolean = false,
         updateLastSave: Boolean = false
     ): Boolean {
-        val keys = RedisKeyBuilder(roomId)
+        val keys = RedisKeyBuilder(fileId)
         val userInfoKey = keys.userInfoKey()
         val userJsonStrings = stringRedisTemplate.opsForList().range(userInfoKey, 0, -1) ?: emptyList()
 
@@ -236,7 +245,7 @@ class CollaborativeEditingService(
                     stringRedisTemplate.opsForList().remove(userInfoKey, 1, userJson)
                     stringRedisTemplate.opsForList().rightPush(userInfoKey, updatedJson)
 
-                    logger.debug("Updated timestamps for user $userName in room $roomId")
+                    logger.debug("Updated timestamps for user $userName in file $fileId")
                     return true
                 }
             } catch (e: Exception) {
@@ -247,10 +256,10 @@ class CollaborativeEditingService(
     }
 
     /**
-     * Get all user sessions for a room.
+     * Get all user sessions for a file.
      */
-    fun getUserSessions(roomId: String): List<UserSessionInfo> {
-        val keys = RedisKeyBuilder(roomId)
+    fun getUserSessions(fileId: UUID): List<UserSessionInfo> {
+        val keys = RedisKeyBuilder(fileId)
         val userInfoKey = keys.userInfoKey()
         val userJsonStrings = stringRedisTemplate.opsForList().range(userInfoKey, 0, -1) ?: emptyList()
 
@@ -265,10 +274,10 @@ class CollaborativeEditingService(
     }
 
     /**
-     * Add user session to room.
+     * Add user session to file.
      */
-    fun addUserSession(roomId: String, sessionId: String, userName: String) {
-        val keys = RedisKeyBuilder(roomId)
+    fun addUserSession(fileId: UUID, sessionId: String, userName: String) {
+        val keys = RedisKeyBuilder(fileId)
         val userInfoKey = keys.userInfoKey()
 
         val userSession = UserSessionInfo(
@@ -282,15 +291,15 @@ class CollaborativeEditingService(
 
         val userJson = objectMapper.writeValueAsString(userSession)
         stringRedisTemplate.opsForList().rightPush(userInfoKey, userJson)
-        stringRedisTemplate.opsForSet().add(RedisKeys.ACTIVE_ROOMS, roomId)
+        stringRedisTemplate.opsForSet().add(RedisKeys.ACTIVE_ROOMS, fileId.toString())
     }
 
     /**
-     * Remove user session from room.
+     * Remove user session from file.
      * Returns true if user was found and removed.
      */
-    fun removeUserSession(roomId: String, sessionId: String): Boolean {
-        val keys = RedisKeyBuilder(roomId)
+    fun removeUserSession(fileId: UUID, sessionId: String): Boolean {
+        val keys = RedisKeyBuilder(fileId)
         val userInfoKey = keys.userInfoKey()
         val userJsonStrings = stringRedisTemplate.opsForList().range(userInfoKey, 0, -1) ?: emptyList()
 
@@ -304,8 +313,8 @@ class CollaborativeEditingService(
                     val remainingUsers = stringRedisTemplate.opsForList().size(userInfoKey) ?: 0
                     if (remainingUsers == 0L) {
                         stringRedisTemplate.delete(userInfoKey)
-                        stringRedisTemplate.opsForSet().remove(RedisKeys.ACTIVE_ROOMS, roomId)
-                        logger.debug("Room $roomId is now inactive (no users)")
+                        stringRedisTemplate.opsForSet().remove(RedisKeys.ACTIVE_ROOMS, fileId.toString())
+                        logger.debug("File $fileId is now inactive (no users)")
                     }
 
                     return true

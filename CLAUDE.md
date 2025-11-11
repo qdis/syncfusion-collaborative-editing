@@ -41,39 +41,52 @@ This application implements real-time collaborative document editing using Opera
 6. Remote clients receive and apply transformed operations
 7. User triggers save → UI calls `ShouldSave` to check, then `SaveDocument` to persist SFDT to MinIO
 
+### File Identification Architecture
+
+Files are identified by **UUID** throughout the system:
+
+- **Database**: H2 in-memory database stores `File(id: UUID, fileName: String unique)` mapping
+- **Redis Keys**: Use UUID string as prefix (e.g., `{uuid}:ops_hash`, `{uuid}:version`)
+- **MinIO Storage**: Files stored by fileName, lookup via database
+- **ActionInfo.roomName**: Contains UUID string (Syncfusion's field repurposed for UUID)
+- **WebSocket**: Uses `x-file-id` header containing UUID string
+- **Frontend**: URLs and API calls use fileId UUID parameter
+
 ### Redis Cache Architecture
 
 Redis uses a **ZSET+HASH structure** for gapless, ordered operation storage:
 
-1. **Operation Storage**: HASH stores operation JSON by version (`roomName:ops_hash`)
-2. **Operation Index**: ZSET maintains order by score=version (`roomName:ops_index`)
-3. **Version Counter**: STRING tracks current version (`roomName:version`)
-4. **Persisted Version**: STRING tracks highest version saved to MinIO (`roomName:persisted_version`)
-5. **User Sessions**: HASH stores user session info with per-user timestamps (`roomName:user_info`)
+1. **Operation Storage**: HASH stores operation JSON by version (`{fileId}:ops_hash`)
+2. **Operation Index**: ZSET maintains order by score=version (`{fileId}:ops_index`)
+3. **Version Counter**: STRING tracks current version (`{fileId}:version`)
+4. **Persisted Version**: STRING tracks highest version saved to MinIO (`{fileId}:persisted_version`)
+5. **User Sessions**: HASH stores user session info with per-user timestamps (`{fileId}:user_info`)
 
 **UI-Initiated Save Pattern:**
 - User triggers save via UI (e.g., Ctrl+S)
-- `ShouldSave` endpoint checks if new operations exist since last save
-- If yes, UI serializes document to SFDT and calls `SaveDocument`
-- `SaveDocument` persists SFDT to MinIO and updates `persisted_version`
+- `ShouldSave` endpoint checks if new operations exist since last save (uses fileId)
+- If yes, UI serializes document to SFDT and calls `SaveDocument` (with fileId)
+- Service looks up fileName from database by fileId
+- `SaveDocument` persists SFDT to MinIO using fileName and updates `persisted_version`
 - `UI_SAVE_CLEANUP_SCRIPT` prunes operations < savedVersion atomically
-- Background cleanup task runs every 30s to remove inactive room keys
+- `ensureVersionMin` script prevents version counter regression after cleanup
+- Background cleanup task runs every 30s to remove inactive file keys
 
-### Lua Scripts for CAS-Based Atomicity
+### Lua Scripts for Atomicity
 
-All Redis operations use Lua scripts (`CollaborativeEditingHelper`) with Compare-And-Swap semantics:
+All Redis operations use Lua scripts (in `src/main/resources/redis/scripts/`) for atomic execution:
 
-- `RESERVE_VERSION_SCRIPT`: Atomically allocate version slot with `__PENDING__` placeholder, return contiguous committed ops for transformation
-- `COMMIT_TRANSFORMED_SCRIPT`: CAS commit - only succeeds if slot still pending and all prior versions are contiguous and committed
-- `GET_PENDING_SCRIPT`: Fetch contiguous committed operations since client version, return resync flag if client is stale
-- `UI_SAVE_CLEANUP_SCRIPT`: Prune operations < savedVersion and update `persisted_version` (UI-initiated save)
+- `append-operation.lua`: Atomically increment version and store operation
+- `get-pending-operations.lua`: Fetch operations since client version with resync detection
+- `ui-save-cleanup.lua`: Prune operations < savedVersion and update `persisted_version` (UI-initiated save)
+- `ensure-version-min.lua`: Prevent version counter regression (ensures version ≥ persisted_version)
+- `init-version-counters.lua`: Initialize version and persisted_version counters for new files
 
-**CAS Retry Flow:**
-1. Reserve version slot (atomically get version + placeholder)
-2. Transform operation locally (no Redis locks held)
-3. Commit with CAS check (verify slot still pending, all priors committed)
-4. On conflict (`GAP_BEFORE`, `PENDING_BEFORE`, `VERSION_CONFLICT`), retry from step 1
-5. Max 5 retries before failing
+**Operation Append Flow:**
+1. Call `ensureVersionMin` to prevent version regression
+2. Check if client version < persisted_version (client is stale)
+3. Atomically append operation with incremented version via `append-operation.lua`
+4. Broadcast operation to connected clients via WebSocket
 
 ### Broadcasting Architecture
 
@@ -89,23 +102,31 @@ All Redis operations use Lua scripts (`CollaborativeEditingHelper`) with Compare
 - `FileController`: File management and listing
 
 **Services:**
-- `MinioService`: S3-compatible document storage (upload/download)
-- `BackgroundService`: Scheduled cleanup task runs every 30s to remove Redis keys for inactive rooms (no users and no pending operations)
+- `MinioService`: S3-compatible document storage (upload/download by fileName)
+- `CollaborativeEditingService`: Core business logic for operations, saves, user sessions
+- `RedisScriptExecutor`: Typed wrapper for executing Lua scripts
+- `BackgroundService`: Scheduled cleanup task runs every 30s to remove Redis keys for inactive files (no users and no pending operations)
 - `RedisSubscriber`: Listens to Redis pub/sub for cross-server synchronization (infrastructure present, not actively used)
-- `DataInitializationService`: Startup service to create bucket and seed sample document
+- `DataInitializationService`: Startup service to create bucket, database records, and seed sample document
+
+**Database:**
+- `File` entity: JPA entity with `id: UUID` and `fileName: String unique`
+- `FileRepository`: JPA repository for fileName ↔ UUID mapping
 
 **Configuration:**
 - `RedisConfig`: Redis client and pub/sub listener setup
+- `RedisScriptConfig`: Lua script bean definitions
 - `MinioConfig`: MinIO S3 client configuration
 - `WebSocketConfig`: STOMP/SockJS endpoint configuration
 - `SecurityConfig`: HTTP Basic authentication with in-memory users (bob, joe, alice)
 
 **Models:**
-- `ActionInfo` (Syncfusion class): Represents a single edit operation with OT metadata
+- `ActionInfo` (Syncfusion class): Represents single edit operation, `roomName` field contains UUID string
 - `UserSessionInfo`: User session with per-user timestamps (lastHeartbeat, lastAction, lastSave)
-- `ShouldSaveRequest`: Pre-check request (roomName, latestAppliedVersion)
-- `UpdateDocumentRequest`: UI save request (roomName, sfdt, latestAppliedVersion)
-- `FilesPathInfo`: Document reference for import
+- `FilesPathInfo`: Document import request (fileId: UUID)
+- `ShouldSaveRequest`: Pre-check request (fileId: UUID, latestAppliedVersion: Int)
+- `UpdateDocumentRequest`: UI save request (fileId: UUID, sfdt: String, latestAppliedVersion: Int)
+- `FileInfo`: Response DTO (fileId: UUID, fileName: String)
 
 ## Syncfusion License
 
@@ -133,26 +154,33 @@ The editor establishes WebSocket (STOMP/SockJS) and connects to Syncfusion colla
 ## API Endpoints
 
 ### REST Endpoints
-- `POST /api/collaborativeediting/ImportFile` - Load document with pending operations (request: `FilesPathInfo`)
-- `POST /api/collaborativeediting/UpdateAction` - Submit edit operation (request: `ActionInfo`, returns transformed `ActionInfo`)
-- `POST /api/collaborativeediting/GetActionsFromServer` - Get missed operations for recovery (request: `ActionInfo`)
-- `POST /api/collaborativeediting/ShouldSave` - Check if new operations exist since last save (request: `ShouldSaveRequest`)
-- `POST /api/collaborativeediting/SaveDocument` - Persist document to MinIO (request: `UpdateDocumentRequest`)
+- `GET /api/files` - List all files (returns `List<FileInfo>` with fileId and fileName)
+- `POST /api/files/upload` - Upload new file, generates UUID (returns `FileUploadResponse` with fileId)
+- `GET /api/files/download/{fileId}` - Download file by UUID
+- `POST /api/collaborativeediting/ImportFile` - Load document with pending operations (request: `FilesPathInfo` with fileId)
+- `POST /api/collaborativeediting/UpdateAction` - Submit edit operation (ActionInfo.roomName contains UUID string)
+- `POST /api/collaborativeediting/GetActionsFromServer` - Get missed operations for recovery (ActionInfo.roomName contains UUID string)
+- `POST /api/collaborativeediting/ShouldSave` - Check if new operations exist since last save (request: `ShouldSaveRequest` with fileId)
+- `POST /api/collaborativeediting/SaveDocument` - Persist document to MinIO (request: `UpdateDocumentRequest` with fileId)
 
 ### WebSocket Endpoints
 - `CONNECT /ws` - SockJS connection endpoint
-- `SUBSCRIBE /topic/public/{roomName}` - Subscribe to room updates
-- `SEND /app/join/{documentName}` - Join collaborative session
+- `SUBSCRIBE /topic/public/{fileId}` - Subscribe to file updates (fileId is UUID string)
+- `SEND /app/init` - Initialize connection with `x-file-id` header containing UUID string
 
 ## Development Notes
 
 - All Kotlin files must start with 2-line ABOUTME comments explaining the file's purpose
-- Redis operations must use Lua scripts with CAS semantics for atomicity (see `CollaborativeEditingHelper`)
+- Redis operations use Lua scripts for atomicity (scripts in `src/main/resources/redis/scripts/`)
 - The ZSET+HASH structure ensures gapless operation sequences - no version number is ever reused or skipped
-- `__PENDING__` placeholders reserve version slots during transformation (prevents gaps during concurrent operations)
-- CAS retry logic in `addOperationsToCache()` handles race conditions when multiple clients submit simultaneously
 - Document saves are UI-initiated (user triggers save) rather than background autosave
-- User session tracking uses per-user timestamps (lastHeartbeat, lastAction, lastSave) in Redis HASH
-- Room names are base64-encoded file names throughout the system
+- User session tracking uses per-user timestamps (lastHeartbeat, lastAction, lastSave) in Redis LIST
+- **File identification**: UUID used throughout system, base64 encoding removed
+- **ActionInfo.roomName**: Syncfusion's field repurposed to contain UUID string (not fileName)
+- **Database**: H2 in-memory with `File` entity mapping UUID to fileName
+- **Redis keys**: Use UUID string as prefix (e.g., `{uuid}:ops_hash`)
+- **MinIO storage**: Files stored by fileName, looked up via database
+- **WebSocket header**: Changed from `x-room-id` to `x-file-id` containing UUID
+- `ensureVersionMin` script prevents version counter from falling behind `persisted_version`
 - Document operations flow through Syncfusion's `WordProcessorHelper` and `CollaborativeEditingHandler`
 - MinIO provides local S3-compatible storage without AWS dependencies

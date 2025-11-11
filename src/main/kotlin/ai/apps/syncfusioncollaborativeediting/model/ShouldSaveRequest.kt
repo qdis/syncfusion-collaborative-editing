@@ -2,7 +2,9 @@
 // ABOUTME: Lightweight pre-check before UI serializes SFDT and calls SaveDocument
 package ai.apps.syncfusioncollaborativeediting.model
 
+import java.util.UUID
+
 data class ShouldSaveRequest(
-    var roomName: String = "",
+    var fileId: UUID,
     var latestAppliedVersion: Int = 0
 )

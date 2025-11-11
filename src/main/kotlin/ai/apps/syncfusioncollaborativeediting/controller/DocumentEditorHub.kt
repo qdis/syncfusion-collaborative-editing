@@ -35,33 +35,35 @@ class DocumentEditorHub(
     @SendToUser("/queue/init")
     fun init(
         @Header(SimpMessageHeaderAccessor.SESSION_ID_HEADER) sessionId: String,
-        @Header(name = "x-room-id", required = false) roomId: String?,
+        @Header(name = "x-file-id", required = false) fileIdString: String?,
         principal: Optional<Principal>
     ): Message<ConnectionInitResponse> {
 
-        logger.info("WebSocket connection initialized: $sessionId for room ID: $roomId")
-        if (roomId == null) {
-            logger.info("WebSocket connection established without room ID.")
+        logger.info("WebSocket connection initialized: $sessionId for file ID: $fileIdString")
+        if (fileIdString == null) {
+            logger.info("WebSocket connection established without file ID.")
             return MessageBuilder.createMessage(
                 ConnectionInitResponse(connectionId = sessionId, users = emptyList()),
                 MessageHeaders(mapOf())
             )
         }
 
-        // Store session-to-room mapping
+        val fileId = UUID.fromString(fileIdString)
+
+        // Store session-to-file mapping
         stringRedisTemplate.opsForHash<String, String>().put(
             RedisKeys.SESSION_TO_ROOM_MAPPING,
             sessionId,
-            roomId
+            fileIdString
         )
 
         // Add user session
         val currentUser = principal.map { it.name }.orElse("Anonymous")
-        collaborativeEditingService.addUserSession(roomId, sessionId, currentUser)
+        collaborativeEditingService.addUserSession(fileId, sessionId, currentUser)
 
-        notifyUserJoined(roomId)
+        notifyUserJoined(fileId)
 
-        val currentUsers = collaborativeEditingService.getUserSessions(roomId)
+        val currentUsers = collaborativeEditingService.getUserSessions(fileId)
 
         return MessageBuilder.createMessage(
             ConnectionInitResponse(
@@ -82,32 +84,33 @@ class DocumentEditorHub(
         val sessionId = event.sessionId
         logger.info("WebSocket connection closed: $sessionId")
 
-        // Get the roomId for the session
-        val roomId = stringRedisTemplate.opsForHash<String, String>().get(
+        // Get the fileId for the session
+        val fileIdString = stringRedisTemplate.opsForHash<String, String>().get(
             RedisKeys.SESSION_TO_ROOM_MAPPING,
             sessionId
         )
-        if (roomId != null) {
-            notifyUserLeft(roomId, sessionId)
+        if (fileIdString != null) {
+            val fileId = UUID.fromString(fileIdString)
+            notifyUserLeft(fileId, sessionId)
         }
     }
 
-    private fun notifyUserJoined(roomId: String) {
-        val usersList = collaborativeEditingService.getUserSessions(roomId)
+    private fun notifyUserJoined(fileId: UUID) {
+        val usersList = collaborativeEditingService.getUserSessions(fileId)
         val addUserHeaders = MessageHeaders(mapOf("action" to "addUser"))
-        logger.info("Broadcasting user joined to room: $roomId with users: ${usersList.map { it.userName }}")
-        broadcastToRoom(roomId, usersList, addUserHeaders)
+        logger.info("Broadcasting user joined to file: $fileId with users: ${usersList.map { it.userName }}")
+        broadcastToRoom(fileId, usersList, addUserHeaders)
     }
 
-    fun notifyUserLeft(roomId: String, sessionId: String) {
-        val removed = collaborativeEditingService.removeUserSession(roomId, sessionId)
+    fun notifyUserLeft(fileId: UUID, sessionId: String) {
+        val removed = collaborativeEditingService.removeUserSession(fileId, sessionId)
 
         if (removed) {
             // Fetch remaining users and broadcast
             val removeUserHeaders = MessageHeaders(mapOf("action" to "removeUser"))
-            broadcastToRoom(roomId, mapOf("connectionId" to sessionId), removeUserHeaders)
+            broadcastToRoom(fileId, mapOf("connectionId" to sessionId), removeUserHeaders)
 
-            // Remove session-to-room mapping
+            // Remove session-to-file mapping
             stringRedisTemplate.opsForHash<String, String>().delete(
                 RedisKeys.SESSION_TO_ROOM_MAPPING,
                 sessionId
@@ -115,9 +118,9 @@ class DocumentEditorHub(
         }
     }
 
-    fun broadcastToRoom(roomName: String, payload: Any, headers: MessageHeaders) {
+    fun broadcastToRoom(fileId: UUID, payload: Any, headers: MessageHeaders) {
         messagingTemplate.convertAndSend(
-            "/topic/public/$roomName",
+            "/topic/public/$fileId",
             MessageBuilder.createMessage(payload, headers)
         )
     }

@@ -1,5 +1,5 @@
-// ABOUTME: Background service for cleanup of inactive room keys and stale user sessions
-// ABOUTME: Removes Redis keys for rooms with no users and removes stale user sessions
+// ABOUTME: Background service for cleanup of inactive file keys and stale user sessions
+// ABOUTME: Removes Redis keys for files with no users and removes stale user sessions
 package ai.apps.syncfusioncollaborativeediting.service
 
 import ai.apps.syncfusioncollaborativeediting.constant.RedisKeys
@@ -11,6 +11,7 @@ import org.springframework.scheduling.annotation.Scheduled
 import org.springframework.stereotype.Service
 import java.time.Duration
 import java.time.Instant
+import java.util.UUID
 
 @Service
 class BackgroundService(
@@ -24,51 +25,53 @@ class BackgroundService(
     @Scheduled(fixedDelayString = "\${collaborative.room-cleanup-interval-ms:30000}")
     fun cleanupInactiveRooms() {
         try {
-            val activeRooms = stringRedisTemplate.opsForSet().members(RedisKeys.ACTIVE_ROOMS) ?: return
+            val activeFileIds = stringRedisTemplate.opsForSet().members(RedisKeys.ACTIVE_ROOMS) ?: return
 
-            for (roomName in activeRooms) {
+            for (fileIdString in activeFileIds) {
+                val fileId = UUID.fromString(fileIdString)
+
                 // First cleanup stale user sessions
-                cleanupStaleUserSessions(roomName)
+                cleanupStaleUserSessions(fileId)
 
-                // Then check if room should be cleaned up
-                val keys = RedisKeyBuilder(roomName)
+                // Then check if file should be cleaned up
+                val keys = RedisKeyBuilder(fileId)
                 val userCount = stringRedisTemplate.opsForList().size(keys.userInfoKey()) ?: 0
 
                 if (userCount == 0L) {
-                    // Room has no users, check last activity
+                    // File has no users, check last activity
                     val lastOp = stringRedisTemplate.opsForZSet()
                         .reverseRange(keys.opsIndexKey(), 0, 0)
                         ?.firstOrNull()
 
                     if (lastOp == null) {
-                        // No ops and no users - cleanup room keys
-                        cleanupRoomKeys(roomName)
+                        // No ops and no users - cleanup file keys
+                        cleanupFileKeys(fileId)
                     }
                 }
             }
         } catch (e: Exception) {
-            logger.error("Room cleanup failed", e)
+            logger.error("File cleanup failed", e)
         }
     }
 
-    private fun cleanupStaleUserSessions(roomName: String) {
+    private fun cleanupStaleUserSessions(fileId: UUID) {
         val staleThresholdMillis = Duration.ofMinutes(2).toMillis()
         val now = Instant.now()
 
-        val users = collaborativeEditingService.getUserSessions(roomName)
+        val users = collaborativeEditingService.getUserSessions(fileId)
 
         for (user in users) {
             val lastHeartbeat = user.lastHeartbeat
             if (lastHeartbeat == null || Duration.between(lastHeartbeat, now).toMillis() > staleThresholdMillis) {
                 // Use notifyUserLeft to handle cleanup and broadcast
-                documentEditorHub.notifyUserLeft(roomName, user.sessionId)
-                logger.info("Removed stale user session: ${user.userName} from room: $roomName (heartbeat missed for 2 minutes)")
+                documentEditorHub.notifyUserLeft(fileId, user.sessionId)
+                logger.info("Removed stale user session: ${user.userName} from file: $fileId (heartbeat missed for 2 minutes)")
             }
         }
     }
 
-    private fun cleanupRoomKeys(roomName: String) {
-        val keys = RedisKeyBuilder(roomName)
+    private fun cleanupFileKeys(fileId: UUID) {
+        val keys = RedisKeyBuilder(fileId)
         val opsCount = stringRedisTemplate.opsForZSet().size(keys.opsIndexKey()) ?: 0
 
         if (opsCount == 0L) {
@@ -80,8 +83,8 @@ class BackgroundService(
                 keys.userInfoKey()
             )
             stringRedisTemplate.delete(keysList)
-            stringRedisTemplate.opsForSet().remove(RedisKeys.ACTIVE_ROOMS, roomName)
-            logger.info("Cleaned up inactive room: $roomName")
+            stringRedisTemplate.opsForSet().remove(RedisKeys.ACTIVE_ROOMS, fileId.toString())
+            logger.info("Cleaned up inactive file: $fileId")
         }
     }
 }
